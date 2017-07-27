@@ -1,0 +1,273 @@
+From 972a2e7e7b1309f7a2610e09df9ac470ba95ade8 Mon Sep 17 00:00:00 2001
+From: ArikaChen <eaglesora@gmail.com>
+Date: Wed, 12 Apr 2017 17:13:28 +0800
+Subject: [PATCH] lvs: add bps and cps limit in keepalived
+
+Signed-off-by: ArikaChen <eaglesora@gmail.com>
+---
+ keepalived/check/check_data.c            |  6 ++++++
+ keepalived/check/check_parser.c          | 16 ++++++++++++++++
+ keepalived/check/ipvswrapper.c           | 11 ++++++++++-
+ keepalived/include/check_data.h          | 12 ++++++++----
+ keepalived/libipvs-2.6/ip_vs.h           | 18 ++++++++++++++++++
+ keepalived/libipvs-2.6/ip_vs_nl_policy.c |  2 ++
+ keepalived/libipvs-2.6/libipvs.c         |  6 ++++++
+ keepalived/libipvs-2.6/libipvs.h         |  5 ++++-
+ 8 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/keepalived/check/check_data.c b/keepalived/check/check_data.c
+index 9ac3c1e..66d5115 100644
+--- a/keepalived/check/check_data.c
++++ b/keepalived/check/check_data.c
+@@ -302,6 +302,10 @@ dump_vs(void *data)
+ 		log_message(LOG_INFO, " LOCAL_ADDR GROUP = %s", vs->local_addr_gname);
+ 	if (vs->vip_bind_dev)
+ 		log_message(LOG_INFO, " vip_bind_dev = %s", vs->vip_bind_dev);
++	if (vs->bps_limit)
++		log_message(LOG_INFO, " bps_limit = %dMbit/s", vs->bps_limit);
++	if (vs->cps_limit)
++		log_message(LOG_INFO, " cps_limit = %d", vs->cps_limit);
+ }
+ 
+ void
+@@ -334,6 +338,8 @@ alloc_vs(char *ip, char *port)
+ 	new->quorum_state = UP;
+ 	new->local_addr_gname = NULL;
+ 	new->vip_bind_dev = NULL;
++	new->bps_limit = 0;
++	new->cps_limit = 0;
+ 
+ 	list_add(check_data->vs, new);
+ }
+diff --git a/keepalived/check/check_parser.c b/keepalived/check/check_parser.c
+index 8936dee..1f32cec 100644
+--- a/keepalived/check/check_parser.c
++++ b/keepalived/check/check_parser.c
+@@ -139,6 +139,20 @@ pto_handler(vector_t *strvec)
+ 	memcpy(vs->timeout_persistence, str, size);
+ }
+ static void
++pbps_handler(vector_t *strvec)
++{
++        virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
++
++	vs->bps_limit = atoi(vector_slot(strvec, 1));
++}
++static void
++pcps_handler(vector_t *strvec)
++{
++        virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
++
++	vs->cps_limit = atoi(vector_slot(strvec, 1));
++}
++static void
+ pgr_handler(vector_t *strvec)
+ {
+ 	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+@@ -375,5 +389,7 @@ check_init_keywords(void)
+ 	install_keyword("syn_proxy", &syn_proxy_handler);
+ 	install_keyword("vip_bind_dev", &bind_dev_handler);
+ 
++	install_keyword("bps_limit", &pbps_handler);
++	install_keyword("cps_limit", &pcps_handler);
+ 	return keywords;
+ }
+diff --git a/keepalived/check/ipvswrapper.c b/keepalived/check/ipvswrapper.c
+index ea23834..2a2d0b1 100644
+--- a/keepalived/check/ipvswrapper.c
++++ b/keepalived/check/ipvswrapper.c
+@@ -574,9 +574,18 @@ ipvs_set_rule(int cmd, virtual_server_t * vs, real_server_t * rs)
+ 		if (vs->granularity_persistence)
+ 			srule->netmask = vs->granularity_persistence;
+ 
+-	if(vs->syn_proxy)
++	if (vs->syn_proxy)
+ 		srule->flags |= IP_VS_CONN_F_SYNPROXY;
++	if (vs->bps_limit) {
++		srule->flags |= IP_VS_SVC_F_BPS_LIMIT;
++		srule->bps_limit = vs->bps_limit;
++	}
++	if (vs->cps_limit) {
++		srule->flags |= IP_VS_SVC_F_CPS_LIMIT;
++		srule->cps_limit = vs->cps_limit;
++	}
+ 
++	log_message(LOG_INFO, "bps_limit %d, cps_limit %d", vs->bps_limit, vs->cps_limit);
+ 	/* SVR specific */
+ 	if (rs) {
+ 		if (cmd == IP_VS_SO_SET_ADDDEST || cmd == IP_VS_SO_SET_DELDEST ||
+diff --git a/keepalived/include/check_data.h b/keepalived/include/check_data.h
+index b2eb456..2ed98a0 100644
+--- a/keepalived/include/check_data.h
++++ b/keepalived/include/check_data.h
+@@ -140,21 +140,23 @@ typedef struct _virtual_server {
+ 	int				alive;
+ 	unsigned			alpha;		/* Alpha mode enabled. */
+ 	unsigned			omega;		/* Omega mode enabled. */
+-	unsigned            syn_proxy;	/* Syn_proxy mode enabled. */
++	unsigned            		syn_proxy;	/* Syn_proxy mode enabled. */
++	uint32_t			bps_limit;
++	uint32_t			cps_limit;
+ 	char				*quorum_up;	/* A hook to call when the VS gains quorum. */
+ 	char				*quorum_down;	/* A hook to call when the VS loses quorum. */
+ 	long unsigned			quorum;		/* Minimum live RSs to consider VS up. */
+ 
+ 	long unsigned			hysteresis;	/* up/down events "lag" WRT quorum. */
+ 	unsigned			quorum_state;	/* Reflects result of the last transition done. */
+-	int					reloaded;   /* quorum_state was copied from old config while reloading */
++	int				reloaded;   /* quorum_state was copied from old config while reloading */
+ #if defined(_WITH_SNMP_) && defined(_KRNL_2_6_) && defined(_WITH_LVS_)
+ 	/* Statistics */
+ 	time_t				lastupdated;
+ 	struct ip_vs_stats_user		stats;
+ #endif
+-	char *local_addr_gname;		/* local ip address group name */
+-	char *vip_bind_dev;		/* the interface name,vip bindto */
++	char 				*local_addr_gname;	/* local ip address group name */
++	char 				*vip_bind_dev;		/* the interface name,vip bindto */
+ } virtual_server_t;
+ 
+ /* Configuration data root */
+@@ -236,6 +238,8 @@ static inline int inaddr_equal(sa_family_t family, void *addr1, void *addr2)
+ 			 (X)->nat_mask                == (Y)->nat_mask			&&\
+ 			 (X)->granularity_persistence == (Y)->granularity_persistence	&&\
+ 			 (X)->syn_proxy		      == (Y)->syn_proxy			&&\
++			 (X)->bps_limit               == (Y)->bps_limit			&&\
++			 (X)->cps_limit               == (Y)->cps_limit			&&\
+ 			 (  (!(X)->quorum_up && !(Y)->quorum_up) || \
+ 			    ((X)->quorum_up && (Y)->quorum_up && !strcmp ((X)->quorum_up, (Y)->quorum_up)) \
+ 			 ) &&\
+diff --git a/keepalived/libipvs-2.6/ip_vs.h b/keepalived/libipvs-2.6/ip_vs.h
+index a100057..f3ab1c8 100644
+--- a/keepalived/libipvs-2.6/ip_vs.h
++++ b/keepalived/libipvs-2.6/ip_vs.h
+@@ -38,6 +38,8 @@
+ #define IP_VS_SVC_F_SCHED1	0x0008		/* scheduler flag 1 */
+ #define IP_VS_SVC_F_SCHED2	0x0010		/* scheduler flag 2 */
+ #define IP_VS_SVC_F_SCHED3	0x0020		/* scheduler flag 3 */
++#define IP_VS_SVC_F_BPS_LIMIT	0x1000	/* bps limit */
++#define IP_VS_SVC_F_CPS_LIMIT	0x2000	/* cps limit */
+ #define IP_VS_CONN_F_SYNPROXY	0x8000	/* synproxy switch flag*/
+ 
+ #define IP_VS_SVC_F_SCHED_SH_FALLBACK	IP_VS_SVC_F_SCHED1 /* SH fallback */
+@@ -139,6 +141,9 @@ struct ip_vs_service_kern {
+ 	unsigned		flags;		/* virtual service flags */
+ 	unsigned		timeout;	/* persistent timeout in sec */
+ 	__be32			netmask;	/* persistent netmask */
++
++	u_int32_t               bps_limit;
++	u_int32_t               cps_limit;
+ };
+ 
+ struct ip_vs_service_user {
+@@ -153,6 +158,10 @@ struct ip_vs_service_user {
+ 	unsigned		flags;		/* virtual service flags */
+ 	unsigned		timeout;	/* persistent timeout in sec */
+ 	__be32			netmask;	/* persistent netmask */
++
++	u_int32_t               bps_limit;
++	u_int32_t               cps_limit;
++
+ 	u_int16_t		af;
+ 	union nf_inet_addr	addr;
+ 	char			pe_name[IP_VS_PENAME_MAXLEN];
+@@ -245,6 +254,9 @@ struct ip_vs_service_entry_kern {
+ 	unsigned		timeout;	/* persistent timeout */
+ 	__be32			netmask;	/* persistent netmask */
+ 
++	u_int32_t               bps_limit;
++	u_int32_t               cps_limit;
++
+ 	/* number of real servers */
+ 	unsigned int		num_dests;
+ 	/* number of local address*/
+@@ -267,6 +279,9 @@ struct ip_vs_service_entry {
+ 	unsigned		timeout;	/* persistent timeout */
+ 	__be32			netmask;	/* persistent netmask */
+ 
++	u_int32_t               bps_limit;
++	u_int32_t               cps_limit;
++
+ 	/* number of real servers */
+ 	unsigned int		num_dests;
+ 	/* number of local address*/
+@@ -517,6 +532,9 @@ enum {
+ 	IPVS_SVC_ATTR_TIMEOUT,		/* persistent timeout */
+ 	IPVS_SVC_ATTR_NETMASK,		/* persistent netmask */
+ 
++	IPVS_SVC_ATTR_BPS_LIMIT,  /* bps limit */
++	IPVS_SVC_ATTR_CPS_LIMIT,  /* cps limit */
++
+ 	IPVS_SVC_ATTR_STATS,		/* nested attribute for service stats */
+ 
+ 	IPVS_SVC_ATTR_PE_NAME,		/* name of scheduler */
+diff --git a/keepalived/libipvs-2.6/ip_vs_nl_policy.c b/keepalived/libipvs-2.6/ip_vs_nl_policy.c
+index 045bcdc..c575613 100644
+--- a/keepalived/libipvs-2.6/ip_vs_nl_policy.c
++++ b/keepalived/libipvs-2.6/ip_vs_nl_policy.c
+@@ -25,6 +25,8 @@ struct nla_policy ipvs_service_policy[IPVS_SVC_ATTR_MAX + 1] = {
+ 					    .minlen = sizeof(struct ip_vs_flags),
+ 					    .maxlen = sizeof(struct ip_vs_flags) },
+ 	[IPVS_SVC_ATTR_TIMEOUT]		= { .type = NLA_U32 },
++	[IPVS_SVC_ATTR_BPS_LIMIT]	= { .type = NLA_U32 },
++	[IPVS_SVC_ATTR_CPS_LIMIT]	= { .type = NLA_U32 },
+ 	[IPVS_SVC_ATTR_NETMASK]		= { .type = NLA_U32 },
+ 	[IPVS_SVC_ATTR_STATS]		= { .type = NLA_NESTED },
+ };
+diff --git a/keepalived/libipvs-2.6/libipvs.c b/keepalived/libipvs-2.6/libipvs.c
+index ba5be21..8303b4e 100644
+--- a/keepalived/libipvs-2.6/libipvs.c
++++ b/keepalived/libipvs-2.6/libipvs.c
+@@ -277,6 +277,8 @@ static int ipvs_nl_fill_service_attr(struct nl_msg *msg, ipvs_service_t *svc)
+ 	NLA_PUT(msg, IPVS_SVC_ATTR_FLAGS, sizeof(flags), &flags);
+ 	NLA_PUT_U32(msg, IPVS_SVC_ATTR_TIMEOUT, svc->timeout);
+ 	NLA_PUT_U32(msg, IPVS_SVC_ATTR_NETMASK, svc->netmask);
++	NLA_PUT_U32(msg, IPVS_SVC_ATTR_BPS_LIMIT, svc->bps_limit);
++	NLA_PUT_U32(msg, IPVS_SVC_ATTR_CPS_LIMIT, svc->cps_limit);
+ 
+ 	nla_nest_end(msg, nl_service);
+ 	return 0;
+@@ -793,6 +795,8 @@ static int ipvs_services_parse_cb(struct nl_msg *msg, void *arg)
+ 	      svc_attrs[IPVS_SVC_ATTR_SCHED_NAME] &&
+ 	      svc_attrs[IPVS_SVC_ATTR_NETMASK] &&
+ 	      svc_attrs[IPVS_SVC_ATTR_TIMEOUT] &&
++	      svc_attrs[IPVS_SVC_ATTR_BPS_LIMIT] &&
++	      svc_attrs[IPVS_SVC_ATTR_CPS_LIMIT] &&
+ 	      svc_attrs[IPVS_SVC_ATTR_FLAGS]))
+ 		return -1;
+ 
+@@ -818,6 +822,8 @@ static int ipvs_services_parse_cb(struct nl_msg *msg, void *arg)
+ 
+ 	get->entrytable[i].netmask = nla_get_u32(svc_attrs[IPVS_SVC_ATTR_NETMASK]);
+ 	get->entrytable[i].timeout = nla_get_u32(svc_attrs[IPVS_SVC_ATTR_TIMEOUT]);
++	get->entrytable[i].bps_limit = nla_get_u32(svc_attrs[IPVS_SVC_ATTR_BPS_LIMIT]);
++	get->entrytable[i].cps_limit = nla_get_u32(svc_attrs[IPVS_SVC_ATTR_CPS_LIMIT]);
+ 	nla_memcpy(&flags, svc_attrs[IPVS_SVC_ATTR_FLAGS], sizeof(flags));
+ 	get->entrytable[i].flags = flags.flags & flags.mask;
+ 
+diff --git a/keepalived/libipvs-2.6/libipvs.h b/keepalived/libipvs-2.6/libipvs.h
+index 956e45e..67f7aed 100644
+--- a/keepalived/libipvs-2.6/libipvs.h
++++ b/keepalived/libipvs-2.6/libipvs.h
+@@ -38,7 +38,9 @@
+ #define OPT_PERSISTENCE_ENGINE  0x400000
+ #define OPT_LOCAL_ADDRESS	0x800000
+ #define OPT_SYNPROXY		0x1000000
+-#define NUMBER_OF_OPT		25
++#define OPT_BPS_LIMIT		0x2000000
++#define OPT_CPS_LIMIT		0x4000000
++#define NUMBER_OF_OPT		27
+ 
+ #define MINIMUM_IPVS_VERSION_MAJOR      1
+ #define MINIMUM_IPVS_VERSION_MINOR      1
+@@ -60,6 +62,7 @@
+  */
+ #define IPVS_SVC_PERSISTENT_TIMEOUT	(6*60)
+ 
++#define IPVS_SVC_DEFAULT_LIMIT	(3000)
+ 
+ typedef struct ip_vs_service_user	ipvs_service_t;
+ typedef struct ip_vs_dest_user		ipvs_dest_t;
+-- 
+1.8.3.1
+

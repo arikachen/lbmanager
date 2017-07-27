@@ -1,0 +1,685 @@
+From d756c85f0cf4e9b6920d6ee47375e45e004a5300 Mon Sep 17 00:00:00 2001
+From: ArikaChen <eaglesora@gmail.com>
+Date: Tue, 18 Apr 2017 09:23:55 +0800
+Subject: [PATCH] lvs: use epoll optimize keepalived
+
+Signed-off-by: ArikaChen <eaglesora@gmail.com>
+---
+ genhash/Makefile.in |   8 +--
+ lib/Makefile.in     |   5 +-
+ lib/epollwrapper.c  | 186 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ lib/epollwrapper.h  |  35 ++++++++++
+ lib/notify.c        |   6 +-
+ lib/parser.c        |   1 +
+ lib/scheduler.c     | 162 +++++++++++++++++++++++++++++++++++++--------
+ lib/scheduler.h     |   9 ++-
+ 8 files changed, 374 insertions(+), 38 deletions(-)
+ create mode 100644 lib/epollwrapper.c
+ create mode 100644 lib/epollwrapper.h
+
+diff --git a/genhash/Makefile.in b/genhash/Makefile.in
+index d41b392..f72f070 100644
+--- a/genhash/Makefile.in
++++ b/genhash/Makefile.in
+@@ -20,7 +20,7 @@ LDFLAGS = @LIBS@ @LDFLAGS@
+ 
+ OBJS = main.o sock.o layer4.o http.o ssl.o
+ LIB_OBJS = ../lib/timer.o ../lib/scheduler.o ../lib/memory.o ../lib/list.o \
+-	   ../lib/utils.o ../lib/html.o ../lib/signals.o ../lib/logger.o
++	   ../lib/utils.o ../lib/html.o ../lib/signals.o ../lib/logger.o ../lib/epollwrapper.o
+ 
+ all:	$(BIN)/$(EXEC)
+ 	$(STRIP) $(BIN)/$(EXEC)
+@@ -54,12 +54,12 @@ mrproper: clean distclean
+ # Code dependencies
+ 
+ main.o: main.c main.h ../lib/utils.h sock.h ../lib/timer.h \
+-	http.h ssl.h ../lib/scheduler.h ../lib/memory.h
++	http.h ssl.h ../lib/scheduler.h ../lib/memory.h ../lib/epollwrapper.h
+ sock.o: sock.c sock.h ../lib/utils.h layer4.h ssl.h main.h \
+ 	../lib/memory.h
+ layer4.o: layer4.c layer4.h ../lib/scheduler.h ../lib/utils.h \
+-	main.h ssl.h
++	main.h ssl.h ../lib/epollwrapper.h
+ http.o: http.c http.h sock.h ../lib/scheduler.h ../lib/utils.h \
+ 	layer4.h main.h ../lib/html.h ../lib/timer.h ../lib/scheduler.h \
+-	../lib/memory.h
++	../lib/memory.h ../lib/epollwrapper.h
+ ssl.o: ssl.c ssl.h http.h main.h ../lib/utils.h ../lib/html.h
+diff --git a/lib/Makefile.in b/lib/Makefile.in
+index ee4691f..393e3d5 100644
+--- a/lib/Makefile.in
++++ b/lib/Makefile.in
+@@ -13,7 +13,7 @@ COMPILE	 = $(CC) $(CFLAGS) $(DEFS)
+ 
+ OBJS = 	memory.o utils.o notify.o timer.o scheduler.o \
+ 	vector.o list.o html.o parser.o signals.o logger.o \
+-	list_head.o buffer.o command.o vty.o
++	list_head.o buffer.o command.o vty.o epollwrapper.o
+ HEADERS = $(OBJS:.o=.h)
+ 
+ .c.o:
+@@ -32,7 +32,7 @@ memory.o: memory.c memory.h utils.h
+ utils.o: utils.c utils.h
+ notify.o: notify.c notify.h
+ timer.o: timer.c timer.h
+-scheduler.o: scheduler.c scheduler.h memory.h utils.h
++scheduler.o: scheduler.c scheduler.h memory.h utils.h epollwrapper.h
+ vector.o: vector.c vector.h memory.h
+ list.o: list.c list.h memory.h
+ html.o: html.c html.h memory.h
+@@ -45,3 +45,4 @@ command.o: command.c command.h vector.h memory.h vty.h timer.h \
+ 	config.h logger.h
+ vty.o: vty.c vty.h scheduler.h timer.h utils.h command.h logger.h \
+ 	memory.h
++epollwrapper.o: epollwrapper.c epollwrapper.h memory.h logger.h
+diff --git a/lib/epollwrapper.c b/lib/epollwrapper.c
+new file mode 100644
+index 0000000..db1d0af
+--- /dev/null
++++ b/lib/epollwrapper.c
+@@ -0,0 +1,186 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <syslog.h>
++#include <sys/epoll.h>
++#include <sys/resource.h>
++
++#include "timer.h"
++#include "memory.h"
++#include "logger.h"
++#include "epollwrapper.h"
++
++//int epollfd;
++//struct epoll_event *events;
++static struct epfdset_entry *epfd_set = NULL;
++
++/* epoll initial */
++void epoll_init(int *epollfd, struct epoll_event **events)
++{
++	struct rlimit limit;
++
++	/* set fd ulimits  */
++	limit.rlim_cur = EPOLL_MAX_FD;
++	limit.rlim_max = EPOLL_MAX_FD;
++	if (setrlimit(RLIMIT_NOFILE, &limit) == -1)
++		log_message(LOG_INFO, "epoll_init: set limit fd to %d failed.", EPOLL_MAX_FD);
++
++	epfd_set = (struct epfdset_entry *) MALLOC(sizeof(struct epfdset_entry) * EPOLL_MAX_FD);
++	if (epfd_set == NULL) {
++		log_message(LOG_INFO, "epoll_init: malloc epfd set failed.");
++		goto fail_fdset;
++	}
++
++	*events = (struct epoll_event *) MALLOC(sizeof(struct epoll_event) * EPOLL_MAX_EV);
++	if (*events == NULL) {
++		log_message(LOG_INFO, "epoll_init: malloc events set failed.");
++		goto fail_events;
++	}
++
++	/* Create epoll fd  */
++	*epollfd = epoll_create(EPOLL_MAX_FD);
++	if(*epollfd == -1) {
++		log_message(LOG_INFO, "epoll_init: epoll_create failed.");
++		goto fail_epfd;
++	}
++
++	return;
++
++fail_epfd:
++	FREE(*events);
++fail_events:
++	FREE(epfd_set);
++fail_fdset:
++	return;
++}
++
++/* epoll clean up  */
++void epoll_cleanup(int *epollfd, struct epoll_event **events)
++{
++	close(*epollfd);
++	*epollfd = -1;
++
++	FREE(*events);
++
++	FREE(epfd_set);
++}
++
++/* wait epoll events */
++int epoll_handler(int epfd, struct epoll_event *events, timeval_t *timer_wait)
++{
++	long timeout;
++
++	timeout = (timer_wait->tv_sec * TIMER_HZ + timer_wait->tv_usec)/1000;
++	if ((0 == timeout) && (timer_wait->tv_usec > 0)) {
++		timeout = 1;
++	}
++
++	return epoll_wait(epfd, events, EPOLL_MAX_EV, timeout);
++}
++
++/* epoll set fd */
++int epoll_set_fd(int epfd, int dir, int fd, void *data)
++{
++	int opcode;
++	struct epoll_event ev;
++
++	if ( !FD_VALID(fd) ) {
++		log_message(LOG_INFO, "epoll_set_fd: fd %d out of range.", fd);
++		return -1;
++	}
++
++	memset(&ev, 0, sizeof(struct epoll_event));
++	ev.data.fd = fd;
++	if (dir == DIR_RD)
++		ev.events |= EPOLLIN;
++	else if (dir == DIR_WR)
++		ev.events |= EPOLLOUT;
++
++	if (epfd_set[fd].events == 0) {
++		opcode = EPOLL_CTL_ADD;
++	} else if( epfd_set[fd].events != ev.events) {
++		opcode = EPOLL_CTL_MOD;
++	} else {
++		/* already exists */
++		epfd_set[fd].data[dir] = data;
++		return 0;
++	}
++
++	if (epoll_ctl(epfd, opcode, fd, &ev) != 0) {
++		log_message(LOG_INFO, "epoll_set_fd: %s fd %d failure.",
++					(opcode == EPOLL_CTL_ADD) ? "ADD":"MOD", fd);
++		return -1;
++	}
++
++	epfd_set[fd].events = ev.events;
++	epfd_set[fd].data[dir] = data;
++
++	return 0;
++}
++
++/* epoll clear fd */
++int epoll_clear_fd(int epfd, int dir, int fd)
++{
++	int opcode;
++	struct epoll_event ev;
++
++	if ( !FD_VALID(fd) ) {
++		log_message(LOG_INFO, "epoll_clear_fd: fd %d out of range.", fd);
++		return -1;
++	}
++
++	if (epfd_set[fd].events == 0) {
++		log_message(LOG_INFO, "epoll_clear_fd: fd %d is not in fdset.", fd);
++		return -1;
++	}
++
++	if (dir == DIR_RD)
++		epfd_set[fd].events &= ~EPOLLIN;
++	else if (dir == DIR_WR)
++		epfd_set[fd].events &= ~EPOLLOUT;
++
++	/* clear default ERR/HUP events */
++//	epfd_set[fd].events &= ~(EPOLLERR | EPOLLHUP);
++
++	if (epfd_set[fd].events == 0) {
++		opcode = EPOLL_CTL_DEL;
++		epfd_set[fd].data[dir] = NULL;
++	} else {
++		opcode = EPOLL_CTL_MOD;
++	}
++
++	ev.events = epfd_set[fd].events;
++	ev.data.fd = fd;
++
++	if (epoll_ctl(epfd, opcode, fd, &ev) != 0) {
++		log_message(LOG_INFO, "epoll_clear_fd: %s fd %d failure.",
++					(opcode == EPOLL_CTL_DEL) ? "DEL":"MOD", fd);
++		return -1;
++	}
++
++	return 0;
++}
++
++void *get_data_by_fd(int fd, int dir)
++{
++	if ( !FD_VALID(fd) ) {
++		log_message(LOG_INFO, "get_data_by_fd: fd %d out of range.", fd);
++		return NULL;
++	}
++
++	return epfd_set[fd].data[dir];
++}
++
++/* if fd is in epoll fdset, return 1, else return 0 */
++int epoll_fdisset(int fd, int dir)
++{
++	if ( !FD_VALID(fd) ) {
++		log_message(LOG_INFO, "epoll_fdisset: fd %d out of range.", fd);
++		return 0;
++	}
++
++	if (((dir == DIR_RD) && ((epfd_set[fd].events & EPOLLIN) == EPOLLIN)) ||
++			((dir == DIR_WR) && ((epfd_set[fd].events & EPOLLOUT) == EPOLLOUT)))
++		return 1;
++
++	return 0;
++}
+diff --git a/lib/epollwrapper.h b/lib/epollwrapper.h
+new file mode 100644
+index 0000000..c3d643e
+--- /dev/null
++++ b/lib/epollwrapper.h
+@@ -0,0 +1,35 @@
++#ifndef _EPOLLWRAPPER_H_
++#define _EPOLLWRAPPER_H_
++
++#include <sys/epoll.h>
++#include "timer.h"
++
++
++#define EPOLL_MAX_FD	50016
++#define EPOLL_MAX_EV	50000
++
++/* fd type in struct epfdset */
++enum {
++	DIR_RD=0,
++	DIR_WR=1,
++	DIR_SIZE
++};
++
++/* epoll fd set entry definition */
++struct epfdset_entry {
++	unsigned int events;
++	void *data[DIR_SIZE];
++};
++
++
++#define FD_VALID(X) ((0 <= (X)) && ((X) < EPOLL_MAX_FD))
++
++extern void epoll_init(int *epollfd, struct epoll_event **events);
++extern void epoll_cleanup(int *epollfd, struct epoll_event **events);
++extern int epoll_handler(int epfd, struct epoll_event *events, timeval_t *timer_wait);
++extern int epoll_set_fd(int epfd, int dir, int fd, void *data);
++extern int epoll_clear_fd(int epfd, int dir, int fd);
++extern void *get_data_by_fd(int fd, int dir);
++extern int epoll_fdisset(int fd, int dir);
++
++#endif
+diff --git a/lib/notify.c b/lib/notify.c
+index 80cc91e..634572e 100644
+--- a/lib/notify.c
++++ b/lib/notify.c
+@@ -77,8 +77,12 @@ notify_exec(char *cmd)
+ 		return 0;
+ 
+ 	signal_handler_destroy();
+-	closeall(0);
++	//closeall(0);
+ 
++	/* attach fd 0,1,2 to /dev/null */
++	close(0);
++	close(1);
++	close(2);
+ 	open("/dev/null", O_RDWR);
+ 
+ 	ret = dup(0);
+diff --git a/lib/parser.c b/lib/parser.c
+index 99511db..d510930 100644
+--- a/lib/parser.c
++++ b/lib/parser.c
+@@ -223,6 +223,7 @@ void read_conf_file(char *conf_file)
+ 			log_message(LOG_INFO, "chdir(%s) error (%s)"
+ 					    , confpath, strerror(errno));
+ 		}
++		free(confpath); 	/* free the memory malloc by strdup */
+ 		process_stream(current_keywords);
+ 		fclose(stream);
+ 
+diff --git a/lib/scheduler.c b/lib/scheduler.c
+index f14c3c1..4a29860 100644
+--- a/lib/scheduler.c
++++ b/lib/scheduler.c
+@@ -40,6 +40,7 @@
+ #include "utils.h"
+ #include "signals.h"
+ #include "logger.h"
++#include "epollwrapper.h"
+ 
+ /* global vars */
+ thread_master_t *master = NULL;
+@@ -51,6 +52,7 @@ thread_make_master(void)
+ 	thread_master_t *new;
+ 
+ 	new = (thread_master_t *) MALLOC(sizeof (thread_master_t));
++	epoll_init(&new->epfd, &new->events);
+ 	return new;
+ }
+ 
+@@ -82,21 +84,49 @@ thread_list_add_before(thread_list_t * list, thread_t * point, thread_t * thread
+ 	list->count++;
+ }
+ 
++/* Add a new thread to the head of list. */
++void
++thread_list_add_head(thread_list_t * list, thread_t * thread)
++{
++	thread->prev = NULL;
++	thread->next = list->head;
++	if (list->head)
++		list->head->prev = thread;
++	else
++		list->tail = thread;
++	list->head = thread;
++	list->count++;
++}
++
++/* Add a new thread to the list. after a point */
++void
++thread_list_add_after(thread_list_t * list, thread_t * point, thread_t * thread)
++{
++	thread->prev = point;
++	thread->next = point->next;
++	if (point->next)
++		point->next->prev = thread;
++	else
++		list->tail = thread;
++	point->next = thread;
++	list->count++;
++}
++
+ /* Add a thread in the list sorted by timeval */
+ void
+ thread_list_add_timeval(thread_list_t * list, thread_t * thread)
+ {
+ 	thread_t *tt;
+ 
+-	for (tt = list->head; tt; tt = tt->next) {
+-		if (timer_cmp(thread->sands, tt->sands) <= 0)
++	for (tt = list->tail; tt; tt = tt->prev) {
++		if (timer_cmp(thread->sands, tt->sands) >= 0)
+ 			break;
+ 	}
+ 
+ 	if (tt)
+-		thread_list_add_before(list, tt, thread);
++		thread_list_add_after(list, tt, thread);
+ 	else
+-		thread_list_add(list, thread);
++		thread_list_add_head(list, thread);
+ }
+ 
+ /* Delete a thread from the list. */
+@@ -185,11 +215,14 @@ thread_cleanup_master(thread_master_t * m)
+ 	thread_destroy_list(m, m->timer);
+ 	thread_destroy_list(m, m->event);
+ 	thread_destroy_list(m, m->ready);
++	thread_destroy_list(m, m->child);
+ 
+ 	/* Clear all FDs */
+-	FD_ZERO(&m->readfd);
+-	FD_ZERO(&m->writefd);
+-	FD_ZERO(&m->exceptfd);
++	//FD_ZERO(&m->readfd);
++	//FD_ZERO(&m->writefd);
++	//FD_ZERO(&m->exceptfd);
++	/* Clear epoll resources */
++	epoll_cleanup(&m->epfd, &m->events);
+ 
+ 	/* Clean garbage */
+ 	thread_clean_unuse(m);
+@@ -239,7 +272,7 @@ thread_add_read(thread_master_t * m, int (*func) (thread_t *)
+ 
+ 	assert(m != NULL);
+ 
+-	if (FD_ISSET(fd, &m->readfd)) {
++	if (epoll_fdisset(fd, DIR_RD)) {
+ 		log_message(LOG_WARNING, "There is already read fd [%d]", fd);
+ 		return NULL;
+ 	}
+@@ -250,7 +283,7 @@ thread_add_read(thread_master_t * m, int (*func) (thread_t *)
+ 	thread->master = m;
+ 	thread->func = func;
+ 	thread->arg = arg;
+-	FD_SET(fd, &m->readfd);
++	epoll_set_fd(m->epfd, DIR_RD, fd, thread);
+ 	thread->u.fd = fd;
+ 
+ 	/* Compute read timeout value */
+@@ -272,7 +305,7 @@ thread_add_write(thread_master_t * m, int (*func) (thread_t *)
+ 
+ 	assert(m != NULL);
+ 
+-	if (FD_ISSET(fd, &m->writefd)) {
++	if (epoll_fdisset(fd, DIR_WR)) {
+ 		log_message(LOG_WARNING, "There is already write fd [%d]", fd);
+ 		return NULL;
+ 	}
+@@ -283,7 +316,7 @@ thread_add_write(thread_master_t * m, int (*func) (thread_t *)
+ 	thread->master = m;
+ 	thread->func = func;
+ 	thread->arg = arg;
+-	FD_SET(fd, &m->writefd);
++	epoll_set_fd(m->epfd, DIR_WR, fd, thread);
+ 	thread->u.fd = fd;
+ 
+ 	/* Compute write timeout value */
+@@ -400,13 +433,13 @@ thread_cancel(thread_t * thread)
+ 
+ 	switch (thread->type) {
+ 	case THREAD_READ:
+-		assert(FD_ISSET(thread->u.fd, &thread->master->readfd));
+-		FD_CLR(thread->u.fd, &thread->master->readfd);
++		assert(epoll_fdisset(thread->u.fd, DIR_RD));
++		epoll_clear_fd(thread->master->epfd, DIR_RD, thread->u.fd);
+ 		thread_list_delete(&thread->master->read, thread);
+ 		break;
+ 	case THREAD_WRITE:
+-		assert(FD_ISSET(thread->u.fd, &thread->master->writefd));
+-		FD_CLR(thread->u.fd, &thread->master->writefd);
++		assert(epoll_fdisset(thread->u.fd, DIR_WR));
++		epoll_clear_fd(thread->master->epfd, DIR_WR, thread->u.fd);
+ 		thread_list_delete(&thread->master->write, thread);
+ 		break;
+ 	case THREAD_TIMER:
+@@ -508,16 +541,15 @@ thread_fetch(thread_master_t * m, thread_t * fetch)
+ {
+ 	int ret, old_errno;
+ 	thread_t *thread;
+-	fd_set readfd;
+-	fd_set writefd;
+-	fd_set exceptfd;
+ 	timeval_t timer_wait;
+ 	int signal_fd;
+ #ifdef _WITH_SNMP_
++	fd_set readfd;
+ 	timeval_t snmp_timer_wait;
+ 	int snmpblock = 0;
+ 	int fdsetsize;
+ #endif
++	int i;
+ 
+ 	assert(m != NULL);
+ 
+@@ -556,13 +588,10 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 	set_time_now();
+ 	thread_compute_timer(m, &timer_wait);
+ 
+-	/* Call select function. */
+-	readfd = m->readfd;
+-	writefd = m->writefd;
+-	exceptfd = m->exceptfd;
++	/* Call epoll function. */
+ 
+ 	signal_fd = signal_rfd();
+-	FD_SET(signal_fd, &readfd);
++	epoll_set_fd(m->epfd, DIR_RD, signal_fd, NULL);
+ 
+ #ifdef _WITH_SNMP_
+ 	/* When SNMP is enabled, we may have to select() on additional
+@@ -578,7 +607,7 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 		memcpy(&timer_wait, &snmp_timer_wait, sizeof(timeval_t));
+ #endif
+ 
+-	ret = select(FD_SETSIZE, &readfd, &writefd, &exceptfd, &timer_wait);
++	ret = epoll_handler(m->epfd, m->events, &timer_wait);
+ 
+ 	/* we have to save errno here because the next syscalls will set it */
+ 	old_errno = errno;
+@@ -591,10 +620,6 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 		snmp_timeout();
+ #endif
+ 
+-	/* handle signals synchronously, including child reaping */
+-	if (FD_ISSET(signal_fd, &readfd))
+-		signal_run_callback();
+-
+ 	/* Update current time */
+ 	set_time_now();
+ 
+@@ -606,6 +631,45 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 		assert(0);
+ 	}
+ 
++	for (i = 0; i < ret; i++) {
++		int fd;
++		thread_t *t;
++
++		fd = m->events[i].data.fd;
++		if (signal_fd == fd) {
++			epoll_clear_fd(m->epfd, DIR_RD, fd);
++			signal_run_callback();
++			continue;
++		}
++
++		/* process read fd */
++		if ((m->events[i].events & (EPOLLIN|EPOLLERR|EPOLLHUP)) && 
++						epoll_fdisset(fd, DIR_RD)) {
++			t = (thread_t *)get_data_by_fd(fd, DIR_RD);
++			if (t != NULL) {
++				epoll_clear_fd(m->epfd, DIR_RD, fd); 
++				thread_list_delete(&m->read, t);
++				thread_list_add(&m->ready, t);
++				t->type = THREAD_READY_FD;
++			}
++		}
++
++		/* process write fd */
++		if ((m->events[i].events & (EPOLLOUT|EPOLLERR|EPOLLHUP)) &&
++						epoll_fdisset(fd, DIR_WR)) {
++			t = (thread_t *)get_data_by_fd(fd, DIR_WR);
++			if (t != NULL) {
++				epoll_clear_fd(m->epfd, DIR_WR, fd);
++				thread_list_delete(&m->write, t);
++				thread_list_add(&m->ready, t);
++				t->type = THREAD_READY_FD;
++			}
++		}
++
++		/* other fd */
++		/* ... */
++	}
++
+ 	/* Timeout children */
+ 	thread = m->child.head;
+ 	while (thread) {
+@@ -618,6 +682,8 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 			thread_list_delete(&m->child, t);
+ 			thread_list_add(&m->ready, t);
+ 			t->type = THREAD_CHILD_TIMEOUT;
++		} else {
++			break;
+ 		}
+ 	}
+ 
+@@ -629,6 +695,43 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 		t = thread;
+ 		thread = t->next;
+ 
++		if (timer_cmp(time_now, t->sands) >= 0) {
++			epoll_clear_fd(m->epfd, DIR_RD, t->u.fd);
++			thread_list_delete(&m->read, t);
++			thread_list_add(&m->ready, t);
++			t->type = THREAD_READ_TIMEOUT;
++		} else {
++			break;
++		}
++	}
++
++	/* Write thead. */
++	thread = m->write.head;
++	while (thread) {
++		thread_t *t;
++
++		t = thread;
++		thread = t->next;
++
++		if (timer_cmp(time_now, t->sands) >= 0) {
++			epoll_clear_fd(m->epfd, DIR_WR, t->u.fd);
++			thread_list_delete(&m->write, t);
++			thread_list_add(&m->ready, t);
++			t->type = THREAD_WRITE_TIMEOUT;
++		} else {
++			break;
++		}
++	}
++
++#if 0   /* select */
++	/* Read thead. */
++	thread = m->read.head;
++	while (thread) {
++		thread_t *t;
++
++		t = thread;
++		thread = t->next;
++
+ 		if (FD_ISSET(t->u.fd, &readfd)) {
+ 			assert(FD_ISSET(t->u.fd, &m->readfd));
+ 			FD_CLR(t->u.fd, &m->readfd);
+@@ -670,6 +773,7 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 	}
+ 	/* Exception thead. */
+ 	/*... */
++#endif  /* select */
+ 
+ 	/* Timer update. */
+ 	thread = m->timer.head;
+@@ -683,6 +787,8 @@ retry:	/* When thread can't fetch try to find next thread again. */
+ 			thread_list_delete(&m->timer, t);
+ 			thread_list_add(&m->ready, t);
+ 			t->type = THREAD_READY;
++		} else {
++			break;
+ 		}
+ 	}
+ 
+diff --git a/lib/scheduler.h b/lib/scheduler.h
+index a2026f4..3533ec8 100644
+--- a/lib/scheduler.h
++++ b/lib/scheduler.h
+@@ -27,6 +27,7 @@
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
++#include <sys/epoll.h>
+ #include <assert.h>
+ #include <fcntl.h>
+ #include <errno.h>
+@@ -69,9 +70,11 @@ typedef struct _thread_master {
+ 	thread_list_t event;
+ 	thread_list_t ready;
+ 	thread_list_t unuse;
+-	fd_set readfd;
+-	fd_set writefd;
+-	fd_set exceptfd;
++	//fd_set readfd;
++	//fd_set writefd;
++	//fd_set exceptfd;
++	int epfd;			/* epoll fd */
++	struct epoll_event *events;	/* epoll events */
+ 	unsigned long alloc;
+ } thread_master_t;
+ 
+-- 
+1.8.3.1
+

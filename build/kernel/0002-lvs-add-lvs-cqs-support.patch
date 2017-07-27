@@ -1,0 +1,1017 @@
+From 7125cffa046b90c7215ee92d6ebd312d99717b59 Mon Sep 17 00:00:00 2001
+From: ArikaChen <eaglesora@gmail.com>
+Date: Thu, 6 Apr 2017 10:44:43 +0800
+Subject: [PATCH] lvs: add lvs cqs and qps support
+
+Signed-off-by: ArikaChen <eaglesora@gmail.com>
+---
+ include/net/ip_vs.h              |  63 +++++++++--
+ net/netfilter/ipvs/Makefile      |   2 +-
+ net/netfilter/ipvs/ip_vs_core.c  |   8 +-
+ net/netfilter/ipvs/ip_vs_ctl.c   | 214 ++++++++++++++++++++++++-----------
+ net/netfilter/ipvs/ip_vs_est.c   | 139 ++++++++++++++---------
+ net/netfilter/ipvs/ip_vs_stats.c | 234 ++++++++++++++++++++++-----------------
+ 6 files changed, 430 insertions(+), 230 deletions(-)
+
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index 6f2bd5c..dcae301 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -232,14 +232,48 @@ struct ip_vs_seq {
+ };
+ 
+ /*
++ * counters per cpu
++ */
++struct ip_vs_counters {
++	__u64		conns;		/* connections scheduled */
++	__u64		inpkts;		/* incoming packets */
++	__u64		outpkts;	/* outgoing packets */
++	__u64		inbytes;	/* incoming bytes */
++	__u64		outbytes;	/* outgoing bytes */
++};
++/*
++ * Stats per cpu
++ */
++struct ip_vs_cpu_stats {
++	struct ip_vs_counters   ustats;
++	struct u64_stats_sync   syncp;
++};
++
++/*
+  *	IPVS statistics objects
+  */
++struct ip_vs_estimator {
++	struct list_head	list;
++
++	u64			last_inbytes;
++	u64			last_outbytes;
++	u64			last_conns;
++	u64			last_inpkts;
++	u64			last_outpkts;
++
++	u32			cps;
++	u32			inpps;
++	u32			outpps;
++	u64			inbps;
++	u64			outbps;
++};
++
+ struct ip_vs_stats {
+-	__u64 conns;		/* connections scheduled */
+-	__u64 inpkts;		/* incoming packets */
+-	__u64 outpkts;		/* outgoing packets */
+-	__u64 inbytes;		/* incoming bytes */
+-	__u64 outbytes;		/* outgoing bytes */
++	struct ip_vs_stats_user	ustats;		/* statistics */
++	struct ip_vs_estimator	est;		/* estimator */
++	struct ip_vs_cpu_stats __percpu	*cpustats;	/* per cpu counters */
++	spinlock_t		lock;		/* spin lock */
++	struct ip_vs_stats_user	ustats0;	/* reset values */
+ };
+ 
+ struct dst_entry;
+@@ -498,7 +532,7 @@ struct ip_vs_service {
+ 	__u32 num_laddrs;	/* number of local ip address */
+ 	struct list_head *curr_laddr;	/* laddr data list head */
+ 
+-	struct ip_vs_stats *stats;	/* Use per-cpu statistics for the service */
++	struct ip_vs_stats stats;	/* Use per-cpu statistics for the service */
+ 	struct ip_vs_app *inc;	/* bind conns to this app inc */
+ 
+ 	/* for scheduling */
+@@ -523,7 +557,7 @@ struct ip_vs_dest {
+ 	atomic_t weight;	/* server weight */
+ 
+ 	atomic_t refcnt;	/* reference counter */
+-	struct ip_vs_stats *stats;	/* Use per-cpu statistics for destination server */
++	struct ip_vs_stats stats;	/* Use per-cpu statistics for destination server */
+ 
+ 	/* connection counters and thresholds */
+ 	atomic_t activeconns;	/* active connections */
+@@ -941,7 +975,7 @@ extern int sysctl_ip_vs_expire_nodest_conn;
+ extern int sysctl_ip_vs_expire_quiescent_template;
+ extern int sysctl_ip_vs_sync_threshold[2];
+ extern int sysctl_ip_vs_nat_icmp_send;
+-extern struct ip_vs_stats *ip_vs_stats;
++extern struct ip_vs_stats ip_vs_stats;
+ extern const struct ctl_path net_vs_ctl_path[];
+ extern int sysctl_ip_vs_timestamp_remove_entry;
+ extern int sysctl_ip_vs_mss_adjust_entry;
+@@ -1000,6 +1034,17 @@ extern int stop_sync_thread(int state);
+ extern void ip_vs_sync_conn(struct ip_vs_conn *cp);
+ 
+ /*
++ *      IPVS rate estimator prototypes (from ip_vs_est.c)
++ */
++extern int ip_vs_estimator_init(void);
++extern void ip_vs_estimator_cleanup(void);
++extern void ip_vs_new_estimator(struct ip_vs_stats *stats);
++extern void ip_vs_kill_estimator(struct ip_vs_stats *stats);
++extern void ip_vs_zero_estimator(struct ip_vs_stats *stats);
++extern void ip_vs_read_estimator(struct ip_vs_stats_user *dst,
++                          struct ip_vs_stats *stats);
++
++/*
+  *      IPVS statistic prototypes (from ip_vs_stats.c)
+  */
+ #define ip_vs_stats_cpu(stats,cpu)  \
+@@ -1008,7 +1053,7 @@ extern void ip_vs_sync_conn(struct ip_vs_conn *cp);
+ #define ip_vs_stats_this_cpu(stats) \
+ 	(*this_cpu_ptr((stats)))
+ 
+-extern int ip_vs_new_stats(struct ip_vs_stats** p);
++extern int ip_vs_new_stats(struct ip_vs_stats* p);
+ extern void ip_vs_del_stats(struct ip_vs_stats* p);
+ extern void ip_vs_zero_stats(struct ip_vs_stats* stats);
+ extern void ip_vs_in_stats(struct ip_vs_conn *cp, struct sk_buff *skb);
+diff --git a/net/netfilter/ipvs/Makefile b/net/netfilter/ipvs/Makefile
+index f7493c5..c533cca 100644
+--- a/net/netfilter/ipvs/Makefile
++++ b/net/netfilter/ipvs/Makefile
+@@ -10,7 +10,7 @@ ip_vs_proto-objs-$(CONFIG_IP_VS_PROTO_AH_ESP) += ip_vs_proto_ah_esp.o
+ 
+ ip_vs-objs :=	ip_vs_conn.o ip_vs_core.o ip_vs_ctl.o ip_vs_sched.o   \
+ 		ip_vs_xmit.o ip_vs_app.o ip_vs_sync.o                 \
+-		ip_vs_proto.o                                         \
++		ip_vs_proto.o ip_vs_est.o                             \
+ 		ip_vs_synproxy.o ip_vs_stats.o                        \
+ 		$(ip_vs_proto-objs-y)
+ 
+diff --git a/net/netfilter/ipvs/ip_vs_core.c b/net/netfilter/ipvs/ip_vs_core.c
+index 63064e3..9360c0a 100644
+--- a/net/netfilter/ipvs/ip_vs_core.c
++++ b/net/netfilter/ipvs/ip_vs_core.c
+@@ -1444,10 +1444,12 @@ static int __init ip_vs_init(void)
+ {
+ 	int ret;
+ 
++	ip_vs_estimator_init();
++
+ 	ret = ip_vs_control_init();
+ 	if (ret < 0) {
+ 		pr_err("can't setup control.\n");
+-		goto out_err;
++		goto cleanup_estimator;
+ 	}
+ 
+ 	ip_vs_protocol_init();
+@@ -1480,7 +1482,8 @@ cleanup_app:
+ cleanup_protocol:
+ 	ip_vs_protocol_cleanup();
+ 	ip_vs_control_cleanup();
+-out_err:
++cleanup_estimator:
++	ip_vs_estimator_cleanup();
+ 	return ret;
+ }
+ 
+@@ -1491,6 +1494,7 @@ static void __exit ip_vs_cleanup(void)
+ 	ip_vs_app_cleanup();
+ 	ip_vs_protocol_cleanup();
+ 	ip_vs_control_cleanup();
++	ip_vs_estimator_cleanup();
+ 	pr_info("ipvs unloaded.\n");
+ }
+ 
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index b7168be..657b821 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -77,6 +77,8 @@ static atomic_t ip_vs_dropentry = ATOMIC_INIT(0);
+ /* number of virtual services */
+ static int ip_vs_num_services = 0;
+ 
++struct ip_vs_stats ip_vs_stats;
++
+ /* sysctl variables */
+ static int sysctl_ip_vs_drop_entry = 0;
+ static int sysctl_ip_vs_drop_packet = 0;
+@@ -151,6 +153,8 @@ int sysctl_ip_vs_conn_expire_tcp_rst = 1;
+ /* L2 fast xmit, response only (to client) */
+ int sysctl_ip_vs_fast_xmit = 1;
+ 
++static void ip_vs_copy_stats(struct ip_vs_stats_user *dst, struct ip_vs_stats *src);
++
+ #ifdef CONFIG_IP_VS_DEBUG
+ static int sysctl_ip_vs_debug_level = 0;
+ 
+@@ -771,7 +775,7 @@ static struct ip_vs_dest *ip_vs_trash_get_dest(struct ip_vs_service *svc,
+ 			__ip_vs_unbind_svc(dest);
+ 
+ 			/* Delete dest dedicated statistic varible which is percpu type */
+-			ip_vs_del_stats(dest->stats);
++			ip_vs_del_stats(&dest->stats);
+ 
+ 			kfree(dest);
+ 		}
+@@ -797,7 +801,7 @@ static void ip_vs_trash_cleanup(void)
+ 		list_del(&dest->n_list);
+ 		ip_vs_dst_reset(dest);
+ 		__ip_vs_unbind_svc(dest);
+-		ip_vs_del_stats(dest->stats);
++		ip_vs_del_stats(&dest->stats);
+ 		kfree(dest);
+ 	}
+ }
+@@ -849,7 +853,7 @@ __ip_vs_update_dest(struct ip_vs_service *svc,
+ 	} else {
+ 		if (dest->svc != svc) {
+ 			__ip_vs_unbind_svc(dest);
+-			ip_vs_zero_stats(dest->stats);
++			ip_vs_zero_stats(&dest->stats);
+ 			__ip_vs_bind_svc(dest, svc);
+ 		}
+ 	}
+@@ -914,11 +918,12 @@ ip_vs_new_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest,
+ 	spin_lock_init(&dest->dst_lock);
+ 
+ 	/* Init statistic */
+-	ret = ip_vs_new_stats(&(dest->stats));
++	ret = ip_vs_new_stats(&dest->stats);
+ 	if(ret)
+ 		goto out_err;
+ 
+ 	__ip_vs_update_dest(svc, dest, udest);
++	ip_vs_new_estimator(&dest->stats);
+ 
+ 
+ 	*dest_p = dest;
+@@ -990,7 +995,8 @@ ip_vs_add_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest)
+ 		list_del(&dest->n_list);
+ 
+ 		/* Reset the statistic value */
+-		ip_vs_zero_stats(dest->stats);
++		ip_vs_zero_stats(&dest->stats);
++		ip_vs_new_estimator(&dest->stats);
+ 
+ 		write_lock_bh(&__ip_vs_svc_lock);
+ 
+@@ -1102,6 +1108,7 @@ ip_vs_edit_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest)
+  */
+ static void __ip_vs_del_dest(struct ip_vs_dest *dest)
+ {
++	ip_vs_kill_estimator(&dest->stats);
+ 	/*
+ 	 *  Remove it from the d-linked list with the real services.
+ 	 */
+@@ -1124,7 +1131,7 @@ static void __ip_vs_del_dest(struct ip_vs_dest *dest)
+ 		atomic_dec(&dest->svc->refcnt);
+ 
+ 		/* Delete dest dedicated statistic varible which is percpu type */
+-		ip_vs_del_stats(dest->stats);
++		ip_vs_del_stats(&dest->stats);
+ 
+ 		kfree(dest);
+ 	} else {
+@@ -1432,10 +1439,12 @@ ip_vs_add_service(struct ip_vs_service_user_kern *u,
+ 		atomic_inc(&ip_vs_nullsvc_counter);
+ 
+ 	/* Init statistic */
+-	ret = ip_vs_new_stats(&(svc->stats));
++	ret = ip_vs_new_stats(&svc->stats);
+ 	if(ret)
+ 		goto out_err;
+ 
++	ip_vs_new_estimator(&svc->stats);
++
+ 	/* Count only IPv4 services for old get/setsockopt interface */
+ 	if (svc->af == AF_INET)
+ 		ip_vs_num_services++;
+@@ -1565,11 +1574,12 @@ static void __ip_vs_del_service(struct ip_vs_service *svc)
+ 	if (svc->af == AF_INET)
+ 		ip_vs_num_services--;
+ 
++	ip_vs_kill_estimator(&svc->stats);
+ 
+ 	/*
+ 	 *    Free statistic related per cpu memory
+ 	 */
+-	ip_vs_del_stats(svc->stats);
++	ip_vs_del_stats(&svc->stats);
+ 
+ 
+ 	/* Unbind scheduler */
+@@ -1697,9 +1707,9 @@ static int ip_vs_zero_service(struct ip_vs_service *svc)
+ 
+ 	write_lock_bh(&__ip_vs_svc_lock);
+ 	list_for_each_entry(dest, &svc->destinations, n_list) {
+-		ip_vs_zero_stats(dest->stats);
++		ip_vs_zero_stats(&dest->stats);
+ 	}
+-	ip_vs_zero_stats(svc->stats);
++	ip_vs_zero_stats(&svc->stats);
+ 	write_unlock_bh(&__ip_vs_svc_lock);
+ 	return 0;
+ }
+@@ -1721,7 +1731,7 @@ static int ip_vs_zero_all(void)
+ 		}
+ 	}
+ 
+-	ip_vs_zero_stats(ip_vs_stats);
++	ip_vs_zero_stats(&ip_vs_stats);
+ 	return 0;
+ }
+ 
+@@ -2389,27 +2399,31 @@ static const struct file_operations ip_vs_info_fops = {
+ 
+ #endif
+ 
+-struct ip_vs_stats *ip_vs_stats;
+-
+ #ifdef CONFIG_PROC_FS
+ static int ip_vs_stats_show(struct seq_file *seq, void *v)
+ {
+-	int i = 0;
++	struct ip_vs_stats_user show;
+ 
++/*                01234567890123456++++01234567890123456++++01234567890123456++++01234567890123456++++01234567890123456 */
+ 	seq_puts(seq,
+-	       /* ++++01234567890123456++++01234567890123456++++01234567890123456++++01234567890123456++++01234567890123456*/
+-		"	          Total             Incoming             Outgoing             Incoming             Outgoing\n");
++		 "            Total             Incoming             Outgoing             Incoming             Outgoing\n");
++	seq_printf(seq,
++		 "            Conns              Packets              Packets                Bytes                Bytes\n");
++
++	ip_vs_copy_stats(&show, &ip_vs_stats);
++	seq_printf(seq, "%17Ld    %17Ld    %17Ld    %17Ld    %17Ld\n\n", 
++		   show.conns,
++		   show.inpkts, 
++		   show.outpkts,
++		   show.inbytes,
++		   show.outbytes);
++
++/*                  0123456789++++0123456789++++01234567890++++01234567890123456++++01234567890123456 */
+ 	seq_puts(seq,
+-		"	          Conns	             Packets		  Packets                Bytes                Bytes\n");
+-
+-	for_each_online_cpu(i) {
+-		seq_printf(seq, "CPU%2d:%17Ld    %17Ld    %17Ld    %17Ld    %17Ld\n", i,
+-			ip_vs_stats_cpu(ip_vs_stats, i).conns,
+-			ip_vs_stats_cpu(ip_vs_stats, i).inpkts,
+-			ip_vs_stats_cpu(ip_vs_stats, i).outpkts,
+-			ip_vs_stats_cpu(ip_vs_stats, i).inbytes,
+-			ip_vs_stats_cpu(ip_vs_stats, i).outbytes);
+-	}
++		   "   Conns/s        Pkts/s         Pkts/s              Bytes/s              Bytes/s\n");
++	seq_printf(seq, "%10d    %10d    %10d    %17Ld    %17Ld\n",
++			show.cps, show.inpps, show.outpps,
++			(u64)show.inbps, (u64)show.outbps);
+ 
+ 	return 0;
+ }
+@@ -2427,6 +2441,77 @@ static const struct file_operations ip_vs_stats_fops = {
+ 	.release = single_release,
+ };
+ 
++static int ip_vs_stats_percpu_show(struct seq_file *seq, void *v)
++{
++	struct ip_vs_stats *tot_stats = &ip_vs_stats;
++	struct ip_vs_cpu_stats __percpu *cpustats = tot_stats->cpustats;
++	struct ip_vs_stats_user rates;
++	int i;
++
++/*                012++++01234567890123456++++01234567890123456++++01234567890123456++++01234567890123456++++01234567890123456 */
++	seq_puts(seq,
++		 "                   Total             Incoming             Outgoing             Incoming             Outgoing\n");
++	seq_printf(seq,
++		 "CPU                Conns              Packets              Packets                Bytes                Bytes\n");
++
++	for_each_possible_cpu(i) {
++		struct ip_vs_cpu_stats *u = per_cpu_ptr(cpustats, i);
++		unsigned int start;
++		__u64 conns, inpkts, outpkts, inbytes, outbytes;
++
++		do {
++			start = u64_stats_fetch_begin_irq(&u->syncp);
++			conns = u->ustats.conns;
++			inpkts = u->ustats.inpkts;
++			outpkts = u->ustats.outpkts;
++			inbytes = u->ustats.inbytes;
++			outbytes = u->ustats.outbytes;
++		} while (u64_stats_fetch_retry_irq(&u->syncp, start));
++
++		seq_printf(seq, "%3d    %17Ld    %17Ld    %17Ld    %17Ld    %17Ld\n",
++			   i, conns, inpkts,
++			   outpkts, inbytes,
++			   outbytes);
++	}
++
++	spin_lock_bh(&tot_stats->lock);
++
++	seq_printf(seq, "  ~    %17Ld    %17Ld    %17Ld    %17Ld    %17Ld\n\n",
++		   tot_stats->ustats.conns,
++		   tot_stats->ustats.inpkts,
++		   tot_stats->ustats.outpkts,
++		   tot_stats->ustats.inbytes,
++		   tot_stats->ustats.outbytes);
++
++	ip_vs_read_estimator(&rates, tot_stats);
++
++	spin_unlock_bh(&tot_stats->lock);
++
++/*                  0123456789++++0123456789++++01234567890++++01234567890123456++++01234567890123456 */
++	seq_puts(seq,
++		   "   Conns/s        Pkts/s         Pkts/s              Bytes/s              Bytes/s\n");
++	seq_printf(seq, "%10d    %10d    %10d    %17Ld    %17Ld\n",
++			rates.cps,
++			rates.inpps,
++			rates.outpps,
++			(u64)rates.inbps,
++			(u64)rates.outbps);
++
++	return 0;
++}
++
++static int ip_vs_stats_percpu_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open_net(inode, file, ip_vs_stats_percpu_show);
++}
++
++static const struct file_operations ip_vs_stats_percpu_fops = {
++	.owner = THIS_MODULE,
++	.open = ip_vs_stats_percpu_seq_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release_net,
++};
+ #endif
+ 
+ #ifdef CONFIG_PROC_FS
+@@ -2774,20 +2859,19 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user * user, unsigned int len)
+ static void
+ ip_vs_copy_stats(struct ip_vs_stats_user *dst, struct ip_vs_stats *src)
+ {
+-	int i = 0;
++#define IP_VS_SHOW_STATS_COUNTER(c) dst->c = src->ustats.c - src->ustats0.c
+ 
+-	/* Set rate related field as zero due estimator is discard in ipvs kernel */
+-	memset(dst, 0x00, sizeof(struct ip_vs_stats_user));
++	spin_lock_bh(&src->lock);
+ 
+-	for_each_online_cpu(i) {
+-		dst->conns    += ip_vs_stats_cpu(src, i).conns;
+-		dst->inpkts   += ip_vs_stats_cpu(src, i).inpkts;
+-		dst->outpkts  += ip_vs_stats_cpu(src, i).outpkts;
+-		dst->inbytes  += ip_vs_stats_cpu(src, i).inbytes;
+-		dst->outbytes += ip_vs_stats_cpu(src, i).outbytes;
+-	}
++	IP_VS_SHOW_STATS_COUNTER(conns);
++	IP_VS_SHOW_STATS_COUNTER(inpkts);
++	IP_VS_SHOW_STATS_COUNTER(outpkts);
++	IP_VS_SHOW_STATS_COUNTER(inbytes);
++	IP_VS_SHOW_STATS_COUNTER(outbytes);
+ 
+-	return;
++	ip_vs_read_estimator(dst, src);
++
++	spin_unlock_bh(&src->lock);
+ }
+ 
+ static void
+@@ -2803,7 +2887,7 @@ ip_vs_copy_service(struct ip_vs_service_entry *dst, struct ip_vs_service *src)
+ 	dst->netmask = src->netmask;
+ 	dst->num_dests = src->num_dests;
+ 	dst->num_laddrs = src->num_laddrs;
+-	ip_vs_copy_stats(&dst->stats, src->stats);
++	ip_vs_copy_stats(&dst->stats, &src->stats);
+ }
+ 
+ static inline int
+@@ -2888,7 +2972,7 @@ __ip_vs_get_dest_entries(const struct ip_vs_get_dests *get,
+ 			entry.activeconns = atomic_read(&dest->activeconns);
+ 			entry.inactconns = atomic_read(&dest->inactconns);
+ 			entry.persistconns = atomic_read(&dest->persistconns);
+-			ip_vs_copy_stats(&entry.stats, dest->stats);
++			ip_vs_copy_stats(&entry.stats, &dest->stats);
+ 			if (copy_to_user(&uptr->entrytable[count],
+ 					 &entry, sizeof(entry))) {
+ 				ret = -EFAULT;
+@@ -3229,36 +3313,31 @@ static const struct nla_policy ip_vs_laddr_policy[IPVS_LADDR_ATTR_MAX + 1] = {
+ static int ip_vs_genl_fill_stats(struct sk_buff *skb, int container_type,
+ 				 struct ip_vs_stats *stats)
+ {
++	struct ip_vs_stats_user ustats;
+ 	struct nlattr *nl_stats = nla_nest_start(skb, container_type);
+-	struct ip_vs_stats tmp_stats;
+-	int i = 0;
+-
+ 	if (!nl_stats)
+ 		return -EMSGSIZE;
+ 
+-	memset((void*)(&tmp_stats), 0x00, sizeof(struct ip_vs_stats));
+-	for_each_online_cpu(i) {
+-		tmp_stats.conns    += ip_vs_stats_cpu(stats, i).conns;
+-		tmp_stats.inpkts   += ip_vs_stats_cpu(stats, i).inpkts;
+-		tmp_stats.outpkts  += ip_vs_stats_cpu(stats, i).outpkts;
+-		tmp_stats.inbytes  += ip_vs_stats_cpu(stats, i).inbytes;
+-		tmp_stats.outbytes += ip_vs_stats_cpu(stats, i).outbytes;
+-	}
+-
+-        nla_put_u64(skb, IPVS_STATS_ATTR_CONNS,    tmp_stats.conns);
+-        nla_put_u64(skb, IPVS_STATS_ATTR_INPKTS,   tmp_stats.inpkts);
+-        nla_put_u64(skb, IPVS_STATS_ATTR_OUTPKTS,  tmp_stats.outpkts);
+-        nla_put_u64(skb, IPVS_STATS_ATTR_INBYTES,  tmp_stats.inbytes);
+-        nla_put_u64(skb, IPVS_STATS_ATTR_OUTBYTES, tmp_stats.outbytes);
+-	nla_put_u32(skb, IPVS_STATS_ATTR_CPS,      0);
+-	nla_put_u32(skb, IPVS_STATS_ATTR_INPPS,    0);
+-	nla_put_u32(skb, IPVS_STATS_ATTR_OUTPPS,   0);
+-	nla_put_u32(skb, IPVS_STATS_ATTR_INBPS,    0);
+-	nla_put_u32(skb, IPVS_STATS_ATTR_OUTBPS,   0);
+-
++	ip_vs_copy_stats(&ustats, stats);
++
++	if (nla_put_u64(skb, IPVS_STATS_ATTR_CONNS, ustats.conns) ||
++	    nla_put_u64(skb, IPVS_STATS_ATTR_INPKTS, ustats.inpkts) ||
++	    nla_put_u64(skb, IPVS_STATS_ATTR_OUTPKTS, ustats.outpkts) ||
++	    nla_put_u64(skb, IPVS_STATS_ATTR_INBYTES, ustats.inbytes) ||
++	    nla_put_u64(skb, IPVS_STATS_ATTR_OUTBYTES, ustats.outbytes) ||
++	    nla_put_u32(skb, IPVS_STATS_ATTR_CPS, ustats.cps) ||
++	    nla_put_u32(skb, IPVS_STATS_ATTR_INPPS, ustats.inpps) ||
++	    nla_put_u32(skb, IPVS_STATS_ATTR_OUTPPS, ustats.outpps) ||
++	    nla_put_u32(skb, IPVS_STATS_ATTR_INBPS, ustats.inbps) ||
++	    nla_put_u32(skb, IPVS_STATS_ATTR_OUTBPS, ustats.outbps))
++		goto nla_put_failure;
+ 	nla_nest_end(skb, nl_stats);
+ 
+ 	return 0;
++
++nla_put_failure:
++	nla_nest_cancel(skb, nl_stats);
++	return -EMSGSIZE;
+ }
+ 
+ static int ip_vs_genl_fill_service(struct sk_buff *skb,
+@@ -3288,7 +3367,7 @@ static int ip_vs_genl_fill_service(struct sk_buff *skb,
+ 	nla_put_u32(skb, IPVS_SVC_ATTR_TIMEOUT, svc->timeout / HZ);
+ 	nla_put_u32(skb, IPVS_SVC_ATTR_NETMASK, svc->netmask);
+ 
+-	if (ip_vs_genl_fill_stats(skb, IPVS_SVC_ATTR_STATS, svc->stats))
++	if (ip_vs_genl_fill_stats(skb, IPVS_SVC_ATTR_STATS, &svc->stats))
+ 		goto nla_put_failure;
+ 
+ 	nla_nest_end(skb, nl_service);
+@@ -3478,7 +3557,7 @@ static int ip_vs_genl_fill_dest(struct sk_buff *skb, struct ip_vs_dest *dest)
+ 	nla_put_u32(skb, IPVS_DEST_ATTR_PERSIST_CONNS,
+ 		    atomic_read(&dest->persistconns));
+ 
+-	if (ip_vs_genl_fill_stats(skb, IPVS_DEST_ATTR_STATS, dest->stats))
++	if (ip_vs_genl_fill_stats(skb, IPVS_DEST_ATTR_STATS, &dest->stats))
+ 		goto nla_put_failure;
+ 
+ 	nla_nest_end(skb, nl_dest);
+@@ -4194,6 +4273,8 @@ int __init ip_vs_control_init(void)
+ 	proc_create("ip_vs_ext_stats", 0, init_net.proc_net, &ip_vs_estats_fops);
+ 	proc_create("ip_vs", 0, init_net.proc_net, &ip_vs_info_fops);
+ 	proc_create("ip_vs_stats", 0, init_net.proc_net, &ip_vs_stats_fops);
++	proc_create("ip_vs_stats_percpu", 0, init_net.proc_net,
++		    &ip_vs_stats_percpu_fops);
+ 
+ 	sysctl_header = register_net_sysctl(&init_net, "net/ipv4/vs", vs_vars);
+ 
+@@ -4206,6 +4287,7 @@ int __init ip_vs_control_init(void)
+ 		INIT_LIST_HEAD(&ip_vs_rtable[idx]);
+ 	}
+ 
++	ip_vs_new_estimator(&ip_vs_stats);
+ 
+ 	/* Hook the defense timer */
+ 	schedule_delayed_work(&defense_work, DEFENSE_TIMER_PERIOD);
+@@ -4229,8 +4311,10 @@ void ip_vs_control_cleanup(void)
+ 	ip_vs_trash_cleanup();
+ 	cancel_delayed_work_sync(&defense_work);
+ 	cancel_work_sync(&defense_work.work);
+-	ip_vs_del_stats(ip_vs_stats);
++	ip_vs_kill_estimator(&ip_vs_stats);
++	ip_vs_del_stats(&ip_vs_stats);
+ 	unregister_sysctl_table(sysctl_header);
++	remove_proc_entry("ip_vs_stats_percpu", init_net.proc_net);
+ 	remove_proc_entry("ip_vs_stats", init_net.proc_net);
+ 	remove_proc_entry("ip_vs", init_net.proc_net);
+ 	remove_proc_entry("ip_vs_ext_stats", init_net.proc_net);
+diff --git a/net/netfilter/ipvs/ip_vs_est.c b/net/netfilter/ipvs/ip_vs_est.c
+index 61e12fd..02b4f18 100644
+--- a/net/netfilter/ipvs/ip_vs_est.c
++++ b/net/netfilter/ipvs/ip_vs_est.c
+@@ -54,13 +54,54 @@ static LIST_HEAD(est_list);
+ static DEFINE_SPINLOCK(est_lock);
+ static DEFINE_TIMER(est_timer, estimation_timer, 0, 0);
+ 
++/*
++ * Make a summary from each cpu
++ */
++static void ip_vs_read_cpu_stats(struct ip_vs_stats_user *sum,
++				 struct ip_vs_cpu_stats __percpu *stats)
++{
++	int i;
++	bool add = false;
++
++	for_each_possible_cpu(i) {
++		struct ip_vs_cpu_stats *s = per_cpu_ptr(stats, i);
++		unsigned int start;
++		__u64 conns, inpkts, outpkts, inbytes, outbytes;
++
++		if (add) {
++			do {
++				start = u64_stats_fetch_begin(&s->syncp);
++				conns = s->ustats.conns;
++				inpkts = s->ustats.inpkts;
++				outpkts = s->ustats.outpkts;
++
++				inbytes = s->ustats.inbytes;
++				outbytes = s->ustats.outbytes;
++			} while (u64_stats_fetch_retry(&s->syncp, start));
++			sum->conns += conns;
++			sum->inpkts += inpkts;
++			sum->outpkts += outpkts;
++			sum->inbytes += inbytes;
++			sum->outbytes += outbytes;
++		} else {
++			add = true;
++			do {
++				start = u64_stats_fetch_begin(&s->syncp);
++				sum->conns = s->ustats.conns;
++				sum->inpkts = s->ustats.inpkts;
++				sum->outpkts = s->ustats.outpkts;
++
++				sum->inbytes = s->ustats.inbytes;
++				sum->outbytes = s->ustats.outbytes;
++			} while (u64_stats_fetch_retry(&s->syncp, start));
++		}
++	}
++}
++
+ static void estimation_timer(unsigned long arg)
+ {
+ 	struct ip_vs_estimator *e;
+ 	struct ip_vs_stats *s;
+-	u64 n_conns;
+-	u64 n_inpkts, n_outpkts;
+-	u64 n_inbytes, n_outbytes;
+ 	u64 rate;
+ 
+ 	spin_lock(&est_lock);
+@@ -68,37 +109,28 @@ static void estimation_timer(unsigned long arg)
+ 		s = container_of(e, struct ip_vs_stats, est);
+ 
+ 		spin_lock(&s->lock);
+-		n_conns = s->ustats.conns;
+-		n_inpkts = s->ustats.inpkts;
+-		n_outpkts = s->ustats.outpkts;
+-		n_inbytes = s->ustats.inbytes;
+-		n_outbytes = s->ustats.outbytes;
++		ip_vs_read_cpu_stats(&s->ustats, s->cpustats);
+ 
+ 		/* scaled by 2^10, but divided 2 seconds */
+-		rate = (n_conns - e->last_conns) << 9;
+-		e->last_conns = n_conns;
+-		e->cps += ((long)rate - (long)e->cps) >> 2;
+-		s->ustats.cps = (e->cps + 0x1FF) >> 10;
+-
+-		rate = (n_inpkts - e->last_inpkts) << 9;
+-		e->last_inpkts = n_inpkts;
+-		e->inpps += ((long)rate - (long)e->inpps) >> 2;
+-		s->ustats.inpps = (e->inpps + 0x1FF) >> 10;
+-
+-		rate = (n_outpkts - e->last_outpkts) << 9;
+-		e->last_outpkts = n_outpkts;
+-		e->outpps += ((long)rate - (long)e->outpps) >> 2;
+-		s->ustats.outpps = (e->outpps + 0x1FF) >> 10;
+-
+-		rate = (n_inbytes - e->last_inbytes) << 4;
+-		e->last_inbytes = n_inbytes;
+-		e->inbps += ((long)rate - (long)e->inbps) >> 2;
+-		s->ustats.inbps = (e->inbps + 0xF) >> 5;
+-
+-		rate = (n_outbytes - e->last_outbytes) << 4;
+-		e->last_outbytes = n_outbytes;
+-		e->outbps += ((long)rate - (long)e->outbps) >> 2;
+-		s->ustats.outbps = (e->outbps + 0xF) >> 5;
++		rate = (s->ustats.conns - e->last_conns) << 9;
++		e->last_conns = s->ustats.conns;
++		e->cps += ((s64)rate - (s64)e->cps) >> 2;
++
++		rate = (s->ustats.inpkts - e->last_inpkts) << 9;
++		e->last_inpkts = s->ustats.inpkts;
++		e->inpps += ((s64)rate - (s64)e->inpps) >> 2;
++
++		rate = (s->ustats.outpkts - e->last_outpkts) << 9;
++		e->last_outpkts = s->ustats.outpkts;
++		e->outpps += ((s64)rate - (s64)e->outpps) >> 2;
++
++		rate = (s->ustats.inbytes - e->last_inbytes) << 4;
++		e->last_inbytes = s->ustats.inbytes;
++		e->inbps += ((s64)rate - (s64)e->inbps) >> 2;
++
++		rate = (s->ustats.outbytes - e->last_outbytes) << 4;
++		e->last_outbytes = s->ustats.outbytes;
++		e->outbps += ((s64)rate - (s64)e->outbps) >> 2;
+ 		spin_unlock(&s->lock);
+ 	}
+ 	spin_unlock(&est_lock);
+@@ -111,21 +143,6 @@ void ip_vs_new_estimator(struct ip_vs_stats *stats)
+ 
+ 	INIT_LIST_HEAD(&est->list);
+ 
+-	est->last_conns = stats->ustats.conns;
+-	est->cps = stats->ustats.cps << 10;
+-
+-	est->last_inpkts = stats->ustats.inpkts;
+-	est->inpps = stats->ustats.inpps << 10;
+-
+-	est->last_outpkts = stats->ustats.outpkts;
+-	est->outpps = stats->ustats.outpps << 10;
+-
+-	est->last_inbytes = stats->ustats.inbytes;
+-	est->inbps = (u64) (stats->ustats.inbps) << 5;
+-
+-	est->last_outbytes = stats->ustats.outbytes;
+-	est->outbps = (u64) (stats->ustats.outbps) << 5;
+-
+ 	spin_lock_bh(&est_lock);
+ 	list_add(&est->list, &est_list);
+ 	spin_unlock_bh(&est_lock);
+@@ -143,13 +160,14 @@ void ip_vs_kill_estimator(struct ip_vs_stats *stats)
+ void ip_vs_zero_estimator(struct ip_vs_stats *stats)
+ {
+ 	struct ip_vs_estimator *est = &stats->est;
+-
+-	/* set counters zero, caller must hold the stats->lock lock */
+-	est->last_inbytes = 0;
+-	est->last_outbytes = 0;
+-	est->last_conns = 0;
+-	est->last_inpkts = 0;
+-	est->last_outpkts = 0;
++	struct ip_vs_stats_user *u = &stats->ustats;
++
++	/* reset counters, caller must hold the stats->lock lock */
++	est->last_inbytes = u->inbytes;
++	est->last_outbytes = u->outbytes;
++	est->last_conns = u->conns;
++	est->last_inpkts = u->inpkts;
++	est->last_outpkts = u->outpkts;
+ 	est->cps = 0;
+ 	est->inpps = 0;
+ 	est->outpps = 0;
+@@ -157,6 +175,19 @@ void ip_vs_zero_estimator(struct ip_vs_stats *stats)
+ 	est->outbps = 0;
+ }
+ 
++/* Get decoded rates */
++void ip_vs_read_estimator(struct ip_vs_stats_user *dst,
++			  struct ip_vs_stats *stats)
++{
++	struct ip_vs_estimator *e = &stats->est;
++
++	dst->cps = (e->cps + 0x1FF) >> 10;
++	dst->inpps = (e->inpps + 0x1FF) >> 10;
++	dst->outpps = (e->outpps + 0x1FF) >> 10;
++	dst->inbps = (e->inbps + 0xF) >> 5;
++	dst->outbps = (e->outbps + 0xF) >> 5;
++}
++
+ int __init ip_vs_estimator_init(void)
+ {
+ 	mod_timer(&est_timer, jiffies + 2 * HZ);
+diff --git a/net/netfilter/ipvs/ip_vs_stats.c b/net/netfilter/ipvs/ip_vs_stats.c
+index 3557e5d..63714be 100644
+--- a/net/netfilter/ipvs/ip_vs_stats.c
++++ b/net/netfilter/ipvs/ip_vs_stats.c
+@@ -1,99 +1,135 @@
+-#include <linux/types.h>
+-#include <linux/percpu.h>
+-#include <net/ip_vs.h>
+-
+-
+-int ip_vs_new_stats(struct ip_vs_stats **p)
+-{
+-	if(NULL == p)
+-		return -EINVAL;
+-
+-	*p = alloc_percpu(struct ip_vs_stats);
+-	if(NULL == *p) {
+-		pr_err("%s: allocate per cpu varible failed \n", __func__);
+-		return -ENOMEM;
+-	}
+-
+-	/* Initial stats */
+-	ip_vs_zero_stats(*p);
+-
+-	return 0;
+-}
+-
+-void ip_vs_del_stats(struct ip_vs_stats* p)
+-{
+-	if(NULL == p)
+-		return;
+-
+-	free_percpu(p);
+-
+-	return;
+-}
+-
+-void ip_vs_zero_stats(struct ip_vs_stats* stats)
+-{
+-	int i = 0;
+-
+-	if(NULL == stats) {
+-		pr_err("%s: Invaild point \n", __func__);
+-		return;
+-	}
+-
+-	for_each_online_cpu(i) {
+-		ip_vs_stats_cpu(stats, i).conns    = 0;
+-		ip_vs_stats_cpu(stats, i).inpkts   = 0;
+-		ip_vs_stats_cpu(stats, i).outpkts  = 0;
+-		ip_vs_stats_cpu(stats, i).inbytes  = 0;
+-		ip_vs_stats_cpu(stats, i).outbytes = 0;
+-	}
+-
+-	return;
+-}
+-
+-void ip_vs_in_stats(struct ip_vs_conn *cp, struct sk_buff *skb)
+-{
+-	struct ip_vs_dest *dest = cp->dest;
+-	if (dest && (dest->flags & IP_VS_DEST_F_AVAILABLE)) {
+-		ip_vs_stats_this_cpu(dest->stats).inpkts++;
+-		ip_vs_stats_this_cpu(dest->stats).inbytes += skb->len;
+-
+-		ip_vs_stats_this_cpu(dest->svc->stats).inpkts++;
+-		ip_vs_stats_this_cpu(dest->svc->stats).inbytes += skb->len;
+-
+-		ip_vs_stats_this_cpu(ip_vs_stats).inpkts++;
+-		ip_vs_stats_this_cpu(ip_vs_stats).inbytes += skb->len;
+-	}
+-
+-	return;
+-}
+-
+-void ip_vs_out_stats(struct ip_vs_conn *cp, struct sk_buff *skb)
+-{
+-	struct ip_vs_dest *dest = cp->dest;
+-	if (dest && (dest->flags & IP_VS_DEST_F_AVAILABLE)) {
+-		ip_vs_stats_this_cpu(dest->stats).outpkts++;
+-		ip_vs_stats_this_cpu(dest->stats).outbytes += skb->len;
+-
+-		ip_vs_stats_this_cpu(dest->svc->stats).outpkts++;
+-		ip_vs_stats_this_cpu(dest->svc->stats).outbytes += skb->len;
+-
+-		ip_vs_stats_this_cpu(ip_vs_stats).outpkts++;
+-		ip_vs_stats_this_cpu(ip_vs_stats).outbytes += skb->len;
+-	}
+-	return;
+-}
+-
+-void ip_vs_conn_stats(struct ip_vs_conn *cp, struct ip_vs_service *svc)
+-{
+-	struct ip_vs_dest *dest = cp->dest;
+-	if(dest) {
+-		ip_vs_stats_this_cpu(dest->stats).conns++;
+-
+-		ip_vs_stats_this_cpu(dest->svc->stats).conns++;
+-
+-		ip_vs_stats_this_cpu(ip_vs_stats).conns++;
+-	}
+-
+-	return;
+-}
+-
++#include <linux/types.h>
++#include <linux/percpu.h>
++#include <net/ip_vs.h>
++
++
++int ip_vs_new_stats(struct ip_vs_stats *p)
++{
++	if(NULL == p)
++		return -EINVAL;
++
++	p->cpustats = alloc_percpu(struct ip_vs_cpu_stats);
++	if(NULL == p->cpustats) {
++		pr_err("%s: allocate per cpu varible failed \n", __func__);
++		return -ENOMEM;
++	}
++
++	/* Initial stats */
++	ip_vs_zero_stats(p);
++
++	return 0;
++}
++
++void ip_vs_del_stats(struct ip_vs_stats* p)
++{
++	if(NULL == p || NULL == p->cpustats)
++		return;
++
++	free_percpu(p->cpustats);
++
++	return;
++}
++
++void ip_vs_zero_stats(struct ip_vs_stats* stats)
++{
++	if(NULL == stats) {
++		pr_err("%s: Invaild point \n", __func__);
++		return;
++	}
++
++	spin_lock_bh(&stats->lock);
++
++	/* get current counters as zero point, rates are zeroed */
++
++#define IP_VS_ZERO_STATS_COUNTER(c) stats->ustats0.c = stats->ustats.c
++
++	IP_VS_ZERO_STATS_COUNTER(conns);
++	IP_VS_ZERO_STATS_COUNTER(inpkts);
++	IP_VS_ZERO_STATS_COUNTER(outpkts);
++	IP_VS_ZERO_STATS_COUNTER(inbytes);
++	IP_VS_ZERO_STATS_COUNTER(outbytes);
++
++	ip_vs_zero_estimator(stats);
++
++	spin_unlock_bh(&stats->lock);
++}
++
++void ip_vs_in_stats(struct ip_vs_conn *cp, struct sk_buff *skb)
++{
++	struct ip_vs_dest *dest = cp->dest;
++	if (dest && (dest->flags & IP_VS_DEST_F_AVAILABLE)) {
++		struct ip_vs_cpu_stats *s;
++
++		s = this_cpu_ptr(dest->stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.inpkts++;
++		s->ustats.inbytes += skb->len;
++		u64_stats_update_end(&s->syncp);
++
++		s = this_cpu_ptr(dest->svc->stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.inpkts++;
++		s->ustats.inbytes += skb->len;
++		u64_stats_update_end(&s->syncp);
++
++		s = this_cpu_ptr(ip_vs_stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.inpkts++;
++		s->ustats.inbytes += skb->len;
++		u64_stats_update_end(&s->syncp);
++	}
++
++	return;
++}
++
++void ip_vs_out_stats(struct ip_vs_conn *cp, struct sk_buff *skb)
++{
++	struct ip_vs_dest *dest = cp->dest;
++	if (dest && (dest->flags & IP_VS_DEST_F_AVAILABLE)) {
++		struct ip_vs_cpu_stats *s;
++
++		s = this_cpu_ptr(dest->stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.outpkts++;
++		s->ustats.outbytes += skb->len;
++		u64_stats_update_end(&s->syncp);
++
++		s = this_cpu_ptr(dest->svc->stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.outpkts++;
++		s->ustats.outbytes += skb->len;
++		u64_stats_update_end(&s->syncp);
++
++		s = this_cpu_ptr(ip_vs_stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.outpkts++;
++		s->ustats.outbytes += skb->len;
++		u64_stats_update_end(&s->syncp);
++	}
++	return;
++}
++
++void ip_vs_conn_stats(struct ip_vs_conn *cp, struct ip_vs_service *svc)
++{
++	struct ip_vs_dest *dest = cp->dest;
++	if(dest) {
++		struct ip_vs_cpu_stats *s;
++
++		s = this_cpu_ptr(dest->stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.conns++;
++		u64_stats_update_end(&s->syncp);
++
++		s = this_cpu_ptr(svc->stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.conns++;
++		u64_stats_update_end(&s->syncp);
++
++		s = this_cpu_ptr(ip_vs_stats.cpustats);
++		u64_stats_update_begin(&s->syncp);
++		s->ustats.conns++;
++		u64_stats_update_end(&s->syncp);
++	}
++	return;
++}
++
+-- 
+1.8.3.1
+

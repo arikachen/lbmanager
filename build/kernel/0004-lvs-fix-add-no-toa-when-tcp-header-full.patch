@@ -1,0 +1,223 @@
+From a79afc21530048d746c17a55341f667fecd30748 Mon Sep 17 00:00:00 2001
+From: ArikaChen <eaglesora@gmail.com>
+Date: Thu, 27 Apr 2017 17:24:13 +0800
+Subject: [PATCH] lvs: fix add no toa when tcp header full
+
+Signed-off-by: ArikaChen <eaglesora@gmail.com>
+---
+ include/net/ip_vs.h                  |   2 +-
+ net/netfilter/ipvs/ip_vs_proto_tcp.c | 127 ++++++++++++++++++++++++++++++++++-
+ net/netfilter/ipvs/ip_vs_synproxy.c  |   3 +-
+ net/netfilter/ipvs/ip_vs_xmit.c      |  10 +--
+ 4 files changed, 133 insertions(+), 9 deletions(-)
+
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index 6a369e0..328dfb4 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -686,7 +686,7 @@ struct ip_vs_app {
+ 	void (*timeout_change) (struct ip_vs_app * app, int flags);
+ };
+ 
+-#define TCPOPT_ADDR  254
++#define TCPOPT_ADDR  200
+ #define TCPOLEN_ADDR 8		/* |opcode|size|ip+port| = 1 + 1 + 6 */
+ 
+ /*
+diff --git a/net/netfilter/ipvs/ip_vs_proto_tcp.c b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+index 7424aac..1681eac 100644
+--- a/net/netfilter/ipvs/ip_vs_proto_tcp.c
++++ b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+@@ -693,6 +693,131 @@ static void tcp_in_adjust_seq(struct ip_vs_conn *cp, struct tcphdr *tcph)
+ 	ip_vs_synproxy_dnat_handler(tcph, &cp->syn_proxy_seq);
+ }
+ 
++// only use when full tcp options
++void tcp_remove_options(struct sk_buff *skb)
++{
++	unsigned char *ptr, *qpr, *tmp, *p;
++	int i;
++	__be32 remain[2];
++	int len = 0, tmp_len;
++	struct tcphdr *th = tcp_hdr(skb);
++	int length = (th->doff * 4) - sizeof(struct tcphdr);
++	tmp_len = length;
++
++	ptr = qpr = (unsigned char *)(th + 1);
++	// remain 8 bytes for toa
++	tmp = ptr + sizeof(struct ip_vs_tcpo_addr);
++
++	while (length > 0) {
++		int opcode = *ptr++;
++		int opsize;
++
++		switch (opcode) {
++		case TCPOPT_EOL:
++			break;
++		case TCPOPT_NOP:	/* Ref: RFC 793 section 3.1 */
++			length--;
++			continue;
++		default:
++			opsize = *ptr++;
++			if (opsize < 2) /* "silly options" */
++				break;
++			if (opsize > length)
++				break;	/* don't parse partial options */
++
++			switch (opcode) {
++			case TCPOPT_MSS:
++				if (opsize == TCPOLEN_MSS && th->syn && (len < 2)) {
++					memcpy((__u8*)(remain + len), ptr - 2, TCPOLEN_MSS);
++					len += 1;
++				}
++				break;
++			case TCPOPT_WINDOW:
++				if (opsize == TCPOLEN_WINDOW && th->syn && (len < 2)) {
++					memcpy((__u8*)(remain + len), ptr - 2, TCPOLEN_WINDOW);
++					p = (unsigned char *)(remain + len) + TCPOLEN_WINDOW;
++					*p = TCPOPT_NOP;
++					len += 1;
++					p = NULL;
++				}
++				break;
++			// ignore other options
++			}
++
++			ptr += opsize-2;
++			length -= opsize;
++		}
++	}
++
++	// clean all options
++	for (i = 0; i < tmp_len; i++) {
++		int opcode = *(qpr + i);
++		if ((opcode != TCPOPT_EOL) && (opcode != TCPOPT_NOP))
++			*(qpr + i) = TCPOPT_NOP;
++	}
++
++	// mv the remain options to offset 8
++	if (len > 0) {
++		memcpy(tmp, (__u8*)remain, len * sizeof(__be32));
++	}
++}
++
++static struct sk_buff *tcp_opt_add_toa_hold(struct ip_vs_conn *cp,
++				       struct sk_buff *old_skb,
++				       struct tcphdr **tcph)
++{
++	struct sk_buff *new_skb = NULL;
++	struct ip_vs_tcpo_addr *toa;
++	unsigned int tcphoff;
++	struct tcphdr *th;
++
++	/* copy all skb, plus ttm space , new skb is linear */
++	new_skb = pskb_copy(old_skb, GFP_ATOMIC);
++	if (new_skb == NULL) {
++		IP_VS_INC_ESTATS(ip_vs_esmib, FULLNAT_ADD_TOA_FAIL_MEM);
++		return old_skb;
++	}
++	/* free old skb */
++	kfree_skb(old_skb);
++
++	tcp_remove_options(new_skb);
++	/*
++	 * add client ip
++	 */
++	tcphoff = ip_hdrlen(new_skb);
++	/* get new tcp header */
++	*tcph = th =
++	    (struct tcphdr *)((void *)skb_network_header(new_skb) + tcphoff);
++
++	/* put client ip opt , ptr point to opts */
++	toa = (struct ip_vs_tcpo_addr *)(th + 1);
++	toa->opcode = TCPOPT_ADDR;
++	toa->opsize = TCPOLEN_ADDR;
++	toa->port = cp->cport;
++	toa->addr = cp->caddr.ip;
++
++	/* re-calculate tcp csum */
++	th->check = 0;
++	new_skb->csum = skb_checksum(new_skb, tcphoff,
++					new_skb->len - tcphoff, 0);
++	th->check = csum_tcpudp_magic(cp->caddr.ip,
++					cp->vaddr.ip,
++					new_skb->len - tcphoff,
++					cp->protocol, new_skb->csum);
++
++	/* re-calculate ip head csum, tot_len has been adjusted */
++	ip_send_check(ip_hdr(new_skb));
++
++	if(new_skb->ip_summed == CHECKSUM_PARTIAL) {
++		new_skb->ip_summed = CHECKSUM_COMPLETE;
++		skb_shinfo(new_skb)->gso_size = 0;
++	}
++
++	IP_VS_INC_ESTATS(ip_vs_esmib, FULLNAT_ADD_TOA_OK);
++
++	return new_skb;
++}
++
+ /*
+  * add client address in tcp option
+  * alloc a new skb, and free the old skb
+@@ -725,7 +850,7 @@ static struct sk_buff *tcp_opt_add_toa(struct ip_vs_conn *cp,
+ 	/* the maximum length of TCP head is 60 bytes, so only 40 bytes for options */
+ 	if ((60 - ((*tcph)->doff << 2)) < sizeof(struct ip_vs_tcpo_addr)) {
+ 		IP_VS_INC_ESTATS(ip_vs_esmib, FULLNAT_ADD_TOA_HEAD_FULL);
+-		return old_skb;
++		return tcp_opt_add_toa_hold(cp, old_skb, tcph);
+ 	}
+ 
+ 	/* copy all skb, plus ttm space , new skb is linear */
+diff --git a/net/netfilter/ipvs/ip_vs_synproxy.c b/net/netfilter/ipvs/ip_vs_synproxy.c
+index e948e25..3f519df 100644
+--- a/net/netfilter/ipvs/ip_vs_synproxy.c
++++ b/net/netfilter/ipvs/ip_vs_synproxy.c
+@@ -385,8 +385,7 @@ syn_proxy_send_rs_syn(int af, const struct tcphdr *th,
+ {
+ 	struct sk_buff *syn_skb;
+ 	int tcp_hdr_size;
+-	// TODO check TCPCB_FLAG_SYN
+-	__u8 tcp_flags = TCPCB_SACKED_RETRANS;
++	__u8 tcp_flags = TCPHDR_SYN;
+ 	unsigned int tcphoff;
+ 	struct tcphdr *new_th;
+ 
+diff --git a/net/netfilter/ipvs/ip_vs_xmit.c b/net/netfilter/ipvs/ip_vs_xmit.c
+index 9e5f34c..9c0411b 100644
+--- a/net/netfilter/ipvs/ip_vs_xmit.c
++++ b/net/netfilter/ipvs/ip_vs_xmit.c
+@@ -1570,7 +1570,7 @@ ip_vs_tunnel_xmit(struct sk_buff *skb, struct ip_vs_conn *cp,
+ 		  struct ip_vs_protocol *pp)
+ {
+ 	struct rtable *rt;	/* Route to the other host */
+-	struct rt6_info *ort;
++	struct rtable *ort;
+ 	struct net_device *tdev;	/* Device to other host */
+ 	struct iphdr *old_iph = ip_hdr(skb);
+ 	u8 tos = old_iph->tos;
+@@ -1601,9 +1601,9 @@ ip_vs_tunnel_xmit(struct sk_buff *skb, struct ip_vs_conn *cp,
+ 		goto tx_error;
+ 	}
+ 
+-        ort = (struct rt6_info *) skb_dst(skb);
+-        if (!skb->dev && skb->sk && skb->sk->sk_state != TCP_TIME_WAIT)
+-                ort->dst.ops->update_pmtu(&ort->dst, skb->sk, NULL, mtu);
++	ort = skb_rtable(skb);
++	if (!skb->dev && skb->sk && skb->sk->sk_state != TCP_TIME_WAIT)
++		ort->dst.ops->update_pmtu(&ort->dst, skb->sk, NULL, mtu);
+ 
+ 	df |= (old_iph->frag_off & htons(IP_DF));
+ 
+@@ -1659,7 +1659,7 @@ ip_vs_tunnel_xmit(struct sk_buff *skb, struct ip_vs_conn *cp,
+ 	iph->protocol = IPPROTO_IPIP;
+ 	iph->tos = tos;
+ 	//TODO
+-	//iph->daddr = rt->rt_dst;
++	iph->daddr = cp->daddr.ip;
+ 	//iph->saddr = rt->rt_src;
+ 	iph->ttl = old_iph->ttl;
+ 	ip_select_ident(skb, &rt->dst, NULL);
+-- 
+1.8.3.1
+

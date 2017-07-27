@@ -1,0 +1,308 @@
+From 9f0def89b2f5fac76a3f476469d250467d194911 Mon Sep 17 00:00:00 2001
+From: ArikaChen <eaglesora@gmail.com>
+Date: Wed, 12 Apr 2017 19:21:02 +0800
+Subject: [PATCH] lvs: add cps_limit and bps_limit support
+
+Signed-off-by: ArikaChen <eaglesora@gmail.com>
+---
+ include/net/ip_vs.h                  | 36 ++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/ip_vs.h           | 11 +++++++++++
+ net/netfilter/ipvs/ip_vs_ctl.c       | 24 +++++++++++++++++++++---
+ net/netfilter/ipvs/ip_vs_proto_tcp.c |  3 ++-
+ net/netfilter/ipvs/ip_vs_proto_udp.c |  3 ++-
+ net/netfilter/ipvs/ip_vs_synproxy.c  | 12 +++++++-----
+ 6 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index dcae301..6a369e0 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -483,6 +483,9 @@ struct ip_vs_service_user_kern {
+ 	unsigned flags;		/* virtual service flags */
+ 	unsigned timeout;	/* persistent timeout in sec */
+ 	u32 netmask;		/* persistent netmask */
++
++        u32 bps_limit;
++        u32 cps_limit;
+ };
+ 
+ struct ip_vs_dest_user_kern {
+@@ -503,6 +506,12 @@ struct ip_vs_laddr_user_kern {
+ 	union nf_inet_addr addr;	/* ip address */
+ };
+ 
++// ipvs security feature
++struct ip_vs_sec {
++        u64 bps_limit;
++        u32 cps_limit;
++};
++
+ /*
+  *	The information about the virtual service offered to the net
+  *	and the forwarding entries
+@@ -522,6 +531,8 @@ struct ip_vs_service {
+ 	unsigned timeout;	/* persistent timeout in ticks */
+ 	__be32 netmask;		/* grouping granularity */
+ 
++	struct ip_vs_sec security;
++
+ 	/* for realservers list */
+ 	struct list_head destinations;	/* real server d-linked list */
+ 	__u32 num_dests;	/* number of servers */
+@@ -753,6 +764,7 @@ enum {
+ 	LRO_REJECT,
+ 	XMIT_UNEXPECTED_MTU,
+ 	CONN_SCHED_UNREACH,
++	LIMIT_RX_DROP,
+ 	IP_VS_EXT_STAT_LAST
+ };
+ 
+@@ -1002,6 +1014,30 @@ static inline void ip_vs_service_put(struct ip_vs_service *svc)
+ 	atomic_dec(&svc->usecnt);
+ }
+ 
++static inline int ip_vs_drop_by_limit(struct ip_vs_service *svc)
++{
++	if (svc->flags & (IP_VS_SVC_F_BPS_LIMIT | IP_VS_SVC_F_CPS_LIMIT)) {
++		u64 bps, inbps, outbps;
++		u32 cps;
++		struct ip_vs_sec *sec = &svc->security;
++		struct ip_vs_stats *stats = &svc->stats;
++		struct ip_vs_estimator *e = &stats->est;
++
++		spin_lock_bh(&stats->lock);
++		cps = (e->cps + 0x1FF) >> 10;
++		inbps = (e->inbps + 0xF) >> 5;
++		outbps = (e->outbps + 0xF) >> 5;
++		spin_unlock_bh(&stats->lock);
++		bps = inbps + outbps;
++
++		if ((svc->flags & IP_VS_SVC_F_BPS_LIMIT) && (bps > sec->bps_limit))
++			return 1;
++		if ((svc->flags & IP_VS_SVC_F_CPS_LIMIT) && (cps > sec->cps_limit))
++			return 1;
++	}
++	return 0;
++}
++
+ extern struct ip_vs_dest *ip_vs_lookup_real_service(int af, __u16 protocol,
+ 						    const union nf_inet_addr
+ 						    *daddr, __be16 dport);
+diff --git a/include/uapi/linux/ip_vs.h b/include/uapi/linux/ip_vs.h
+index 17f51e7..106cf93 100644
+--- a/include/uapi/linux/ip_vs.h
++++ b/include/uapi/linux/ip_vs.h
+@@ -20,6 +20,8 @@
+ #define IP_VS_SVC_F_PERSISTENT	0x0001	/* persistent port */
+ #define IP_VS_SVC_F_HASHED	0x0002	/* hashed entry */
+ #define IP_VS_SVC_F_ONEPACKET	0x0004	/* one-packet scheduling */
++#define IP_VS_SVC_F_BPS_LIMIT   0x1000  /* bps limit */
++#define IP_VS_SVC_F_CPS_LIMIT   0x2000  /* cps limit */
+ 
+ /*
+  *      Destination Server Flags
+@@ -111,6 +113,9 @@ struct ip_vs_service_user {
+ 	unsigned flags;		/* virtual service flags */
+ 	unsigned timeout;	/* persistent timeout in sec */
+ 	__be32 netmask;		/* persistent netmask */
++
++	__u32 bps_limit;
++	__u32 conn_limit;
+ };
+ 
+ struct ip_vs_dest_user {
+@@ -174,6 +179,9 @@ struct ip_vs_service_entry {
+ 	unsigned timeout;	/* persistent timeout */
+ 	__be32 netmask;		/* persistent netmask */
+ 
++        __u32 bps_limit;
++        __u32 conn_limit;
++
+ 	/* number of real servers */
+ 	unsigned int num_dests;
+ 
+@@ -351,6 +359,9 @@ enum {
+ 	IPVS_SVC_ATTR_TIMEOUT,	/* persistent timeout */
+ 	IPVS_SVC_ATTR_NETMASK,	/* persistent netmask */
+ 
++	IPVS_SVC_ATTR_BPS_LIMIT,  /* bps limit */
++	IPVS_SVC_ATTR_CPS_LIMIT,  /* cps limit */
++
+ 	IPVS_SVC_ATTR_STATS,	/* nested attribute for service stats */
+ 	__IPVS_SVC_ATTR_MAX,
+ };
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index 657b821..9f98ba8 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -153,6 +153,8 @@ int sysctl_ip_vs_conn_expire_tcp_rst = 1;
+ /* L2 fast xmit, response only (to client) */
+ int sysctl_ip_vs_fast_xmit = 1;
+ 
++#define BPS_UNIT 1000000
++
+ static void ip_vs_copy_stats(struct ip_vs_stats_user *dst, struct ip_vs_stats *src);
+ 
+ #ifdef CONFIG_IP_VS_DEBUG
+@@ -1416,6 +1418,8 @@ ip_vs_add_service(struct ip_vs_service_user_kern *u,
+ 	svc->flags = u->flags;
+ 	svc->timeout = u->timeout * HZ;
+ 	svc->netmask = u->netmask;
++	svc->security.bps_limit = (u64)u->bps_limit * BPS_UNIT;
++	svc->security.cps_limit = u->cps_limit;
+ 
+ 	/* Init the local address stuff */
+ 	rwlock_init(&svc->laddr_lock);
+@@ -1516,6 +1520,8 @@ ip_vs_edit_service(struct ip_vs_service *svc, struct ip_vs_service_user_kern *u)
+ 	svc->flags = u->flags | IP_VS_SVC_F_HASHED;
+ 	svc->timeout = u->timeout * HZ;
+ 	svc->netmask = u->netmask;
++	svc->security.bps_limit = (u64)u->bps_limit << 6;
++        svc->security.cps_limit = u->cps_limit;
+ 
+ 	old_sched = svc->scheduler;
+ 	if (sched != old_sched) {
+@@ -2340,8 +2346,12 @@ static int ip_vs_info_seq_show(struct seq_file *seq, void *v)
+ 		}
+ 
+ 		if (svc->flags & IP_VS_SVC_F_PERSISTENT)
+-			seq_printf(seq, "persistent %d %08X\n",
++			seq_printf(seq, "persistent %d %08X ",
+ 				   svc->timeout, ntohl(svc->netmask));
++		if (svc->flags & IP_VS_SVC_F_BPS_LIMIT)
++			seq_printf(seq, "bps_limit %Ld ", svc->security.bps_limit);
++		if (svc->flags & IP_VS_SVC_F_CPS_LIMIT)
++			seq_printf(seq, "cps_limit %d\n", svc->security.cps_limit);
+ 		else
+ 			seq_putc(seq, '\n');
+ 
+@@ -2578,6 +2588,7 @@ static struct ip_vs_estats_entry ext_stats[] = {
+ 	IP_VS_ESTATS_ITEM("lro_reject", LRO_REJECT),
+ 	IP_VS_ESTATS_ITEM("xmit_unexpected_mtu", XMIT_UNEXPECTED_MTU),
+ 	IP_VS_ESTATS_ITEM("conn_sched_unreach", CONN_SCHED_UNREACH),
++	IP_VS_ESTATS_ITEM("rx_dropped", LIMIT_RX_DROP),
+ 	IP_VS_ESTATS_LAST
+ };
+ 
+@@ -3366,6 +3377,8 @@ static int ip_vs_genl_fill_service(struct sk_buff *skb,
+ 	nla_put(skb, IPVS_SVC_ATTR_FLAGS, sizeof(flags), &flags);
+ 	nla_put_u32(skb, IPVS_SVC_ATTR_TIMEOUT, svc->timeout / HZ);
+ 	nla_put_u32(skb, IPVS_SVC_ATTR_NETMASK, svc->netmask);
++	nla_put_u32(skb, IPVS_SVC_ATTR_BPS_LIMIT, svc->security.bps_limit / BPS_UNIT);
++	nla_put_u32(skb, IPVS_SVC_ATTR_CPS_LIMIT, svc->security.cps_limit);
+ 
+ 	if (ip_vs_genl_fill_stats(skb, IPVS_SVC_ATTR_STATS, &svc->stats))
+ 		goto nla_put_failure;
+@@ -3481,7 +3494,7 @@ static int ip_vs_genl_parse_service(struct ip_vs_service_user_kern *usvc,
+ 	/* If a full entry was requested, check for the additional fields */
+ 	if (full_entry) {
+ 		struct nlattr *nla_sched, *nla_flags, *nla_timeout,
+-		    *nla_netmask;
++		    *nla_netmask, *nla_bps_limit, *nla_cps_limit;
+ 		struct ip_vs_flags flags;
+ 		struct ip_vs_service *svc;
+ 
+@@ -3489,8 +3502,11 @@ static int ip_vs_genl_parse_service(struct ip_vs_service_user_kern *usvc,
+ 		nla_flags = attrs[IPVS_SVC_ATTR_FLAGS];
+ 		nla_timeout = attrs[IPVS_SVC_ATTR_TIMEOUT];
+ 		nla_netmask = attrs[IPVS_SVC_ATTR_NETMASK];
++		nla_bps_limit = attrs[IPVS_SVC_ATTR_BPS_LIMIT];
++		nla_cps_limit = attrs[IPVS_SVC_ATTR_CPS_LIMIT];
+ 
+-		if (!(nla_sched && nla_flags && nla_timeout && nla_netmask))
++		if (!(nla_sched && nla_flags && nla_timeout && nla_netmask 
++			&& nla_bps_limit && nla_cps_limit))
+ 			return -EINVAL;
+ 
+ 		nla_memcpy(&flags, nla_flags, sizeof(flags));
+@@ -3513,6 +3529,8 @@ static int ip_vs_genl_parse_service(struct ip_vs_service_user_kern *usvc,
+ 		usvc->sched_name = nla_data(nla_sched);
+ 		usvc->timeout = nla_get_u32(nla_timeout);
+ 		usvc->netmask = nla_get_u32(nla_netmask);
++		usvc->bps_limit = nla_get_u32(nla_bps_limit);
++		usvc->cps_limit = nla_get_u32(nla_cps_limit);
+ 	}
+ 
+ 	return 0;
+diff --git a/net/netfilter/ipvs/ip_vs_proto_tcp.c b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+index 20571b8..7424aac 100644
+--- a/net/netfilter/ipvs/ip_vs_proto_tcp.c
++++ b/net/netfilter/ipvs/ip_vs_proto_tcp.c
+@@ -106,12 +106,13 @@ tcp_conn_schedule(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
+ 	if (th->syn && !th->ack && !th->fin && !th->rst &&
+ 	    (svc = ip_vs_service_get(af, skb->mark, iph.protocol, &iph.daddr,
+ 				     th->dest))) {
+-		if (ip_vs_todrop()) {
++		if (ip_vs_todrop() || ip_vs_drop_by_limit(svc)) {
+ 			/*
+ 			 * It seems that we are very loaded.
+ 			 * We have to drop this packet :(
+ 			 */
+ 			ip_vs_service_put(svc);
++			IP_VS_INC_ESTATS(ip_vs_esmib, LIMIT_RX_DROP);
+ 			*verdict = NF_DROP;
+ 			return 0;
+ 		}
+diff --git a/net/netfilter/ipvs/ip_vs_proto_udp.c b/net/netfilter/ipvs/ip_vs_proto_udp.c
+index 716e406..25c3274 100644
+--- a/net/netfilter/ipvs/ip_vs_proto_udp.c
++++ b/net/netfilter/ipvs/ip_vs_proto_udp.c
+@@ -98,12 +98,13 @@ udp_conn_schedule(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
+ 	svc = ip_vs_service_get(af, skb->mark, iph.protocol,
+ 				&iph.daddr, uh->dest);
+ 	if (svc) {
+-		if (ip_vs_todrop()) {
++		if (ip_vs_todrop() || ip_vs_drop_by_limit(svc)) {
+ 			/*
+ 			 * It seems that we are very loaded.
+ 			 * We have to drop this packet :(
+ 			 */
+ 			ip_vs_service_put(svc);
++			IP_VS_INC_ESTATS(ip_vs_esmib, LIMIT_RX_DROP);
+ 			*verdict = NF_DROP;
+ 			return 0;
+ 		}
+diff --git a/net/netfilter/ipvs/ip_vs_synproxy.c b/net/netfilter/ipvs/ip_vs_synproxy.c
+index df7d0fb..e948e25 100644
+--- a/net/netfilter/ipvs/ip_vs_synproxy.c
++++ b/net/netfilter/ipvs/ip_vs_synproxy.c
+@@ -255,16 +255,17 @@ ip_vs_synproxy_syn_rcv(int af, struct sk_buff *skb,
+ 	     ip_vs_service_get(af, skb->mark, iph->protocol, &iph->daddr,
+ 			       th->dest))
+ 	    && (svc->flags & IP_VS_CONN_F_SYNPROXY)) {
+-		// release service here, because don't use it any all.
+-		ip_vs_service_put(svc);
+-
+-		if (ip_vs_todrop()) {
++		if (ip_vs_todrop() || ip_vs_drop_by_limit(svc)) {
+ 			/*
+ 			 * It seems that we are very loaded.
+ 			 * We have to drop this packet :(
+ 			 */
++			ip_vs_service_put(svc);
++			IP_VS_INC_ESTATS(ip_vs_esmib, LIMIT_RX_DROP);
+ 			goto syn_rcv_out;
+ 		}
++		// release service here, because don't use it any all.
++		ip_vs_service_put(svc);
+ 	} else {
+ 		/*
+ 		 * release service.
+@@ -551,12 +552,13 @@ ip_vs_synproxy_ack_rcv(int af, struct sk_buff *skb, struct tcphdr *th,
+ 	    (svc =
+ 	     ip_vs_service_get(af, skb->mark, iph->protocol, &iph->daddr,
+ 			       th->dest))) {
+-		if (ip_vs_todrop()) {
++		if (ip_vs_todrop() || ip_vs_drop_by_limit(svc)) {
+ 			/*
+ 			 * It seems that we are very loaded.
+ 			 * We have to drop this packet :(
+ 			 */
+ 			ip_vs_service_put(svc);
++			IP_VS_INC_ESTATS(ip_vs_esmib, LIMIT_RX_DROP);
+ 			*verdict = NF_DROP;
+ 			return 0;
+ 		}
+-- 
+1.8.3.1
+

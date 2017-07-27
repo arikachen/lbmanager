@@ -1,0 +1,33 @@
+From 6ce8f85f04e10988ae1e1ec3208b8d60c866013b Mon Sep 17 00:00:00 2001
+From: ArikaChen <eaglesora@gmail.com>
+Date: Wed, 10 May 2017 15:32:08 +0800
+Subject: [PATCH] lvs: fix rs not active sometime when host reboot
+
+Signed-off-by: ArikaChen <eaglesora@gmail.com>
+---
+ keepalived/check/ipvswrapper.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/keepalived/check/ipvswrapper.c b/keepalived/check/ipvswrapper.c
+index 2a2d0b1..30a6f46 100644
+--- a/keepalived/check/ipvswrapper.c
++++ b/keepalived/check/ipvswrapper.c
+@@ -585,7 +585,6 @@ ipvs_set_rule(int cmd, virtual_server_t * vs, real_server_t * rs)
+ 		srule->cps_limit = vs->cps_limit;
+ 	}
+ 
+-	log_message(LOG_INFO, "bps_limit %d, cps_limit %d", vs->bps_limit, vs->cps_limit);
+ 	/* SVR specific */
+ 	if (rs) {
+ 		if (cmd == IP_VS_SO_SET_ADDDEST || cmd == IP_VS_SO_SET_DELDEST ||
+@@ -764,6 +763,7 @@ ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
+ 	/* Does the service use inhibit flag ? */
+ 	if (cmd == IP_VS_SO_SET_DELDEST && rs->inhibit) {
+ 		drule->weight = 0;
++		rs->set = 1;
+ 		cmd = IP_VS_SO_SET_EDITDEST;
+ 	}
+ 	if (cmd == IP_VS_SO_SET_ADDDEST && rs->inhibit && rs->set)
+-- 
+1.8.3.1
+
