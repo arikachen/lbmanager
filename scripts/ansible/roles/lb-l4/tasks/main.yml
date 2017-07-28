@@ -17,6 +17,6 @@
 
 - name: Install lvs packages
   shell: /root/lvs-deploy/deploy/deploy.sh /root/lvs-deploy/deploy.env
-  #notify: Reboot
+  notify: Reboot
   tags:
     - deploy
