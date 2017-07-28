@@ -1,0 +1,22 @@
+---
+
+- name: Install lvs deploy script
+  copy: src=../../../../deploy dest=/root/lvs-deploy/ mode=0755
+  tags:
+    - deploy
+
+- name: Install system tuning script
+  copy: src=../../../../system dest=/root/lvs-deploy/ mode=0755
+  tags:
+    - deploy
+
+- name: Copy deploy.env
+  template: src=deploy.env.j2 dest=/root/lvs-deploy/deploy.env
+  tags:
+    - deploy
+
+- name: Install lvs packages
+  shell: /root/lvs-deploy/deploy/deploy.sh /root/lvs-deploy/deploy.env
+  #notify: Reboot
+  tags:
+    - deploy

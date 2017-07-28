@@ -1,0 +1,12 @@
+[l4]
+10.x.x.x ansible_ssh_host=10.x.x.x
+
+[l4:vars]
+cluster_name=lvs-cluster
+up_link=eth0
+ospf_area=0.0.0.11
+ospf_vip=1.1.1.0/24
+ospf_route_filter=1.1.1.0/24,2.2.2.0/26
+etcd_endpoints=127.0.0.1
+subnet_name=test
+port=10000

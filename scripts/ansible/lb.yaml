@@ -1,0 +1,4 @@
+---
+- hosts: l4
+  roles:
+    - {role: lb-l4, tags: [ 'l4' ]}
