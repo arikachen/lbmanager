@@ -84,11 +84,9 @@ upstream {{$upstream.Name}} {
 server {
 	listen {{if ne $vip ""}}{{$vip}}:{{end}}{{$port}} {{if eq $prot "UDP"}}udp{{end}} reuseport;
 
-	access_log /var/log/nginx/{{$name}}-{{$port}}.log  main buffer=32k flush=5s;
-
-	root /usr/share/nginx/html;
-
 	{{if eq $prot "HTTP"}}
+	access_log /var/log/nginx/{{$name}}-{{$port}}.log  main buffer=32k flush=5s;
+	root /usr/share/nginx/html;
 	{{range $location := $localtions}}
 	location {{$location.URIPath}} {
 		proxy_pass http://{{$location.PoolName}};
