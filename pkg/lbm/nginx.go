@@ -33,8 +33,8 @@ func NewNginxImpl() *NginxImpl {
 }
 
 func (n *NginxImpl) Parse(key string, data []byte) (interface{}, error) {
-	var lb Nginx
-	err := json.Unmarshal(data, &lb)
+	lb := NewNginx()
+	err := json.Unmarshal(data, lb)
 	if err != nil {
 		glog.Warningf("Faild to unmarshal lb %s, error: %v", key, err)
 		return nil, err
@@ -46,7 +46,7 @@ func (n *NginxImpl) Parse(key string, data []byte) (interface{}, error) {
 		return nil, err
 	}
 
-	return &lb, nil
+	return lb, nil
 }
 
 func (n *NginxImpl) ConfigService(lb interface{}) bool {
