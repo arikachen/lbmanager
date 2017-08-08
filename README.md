@@ -57,7 +57,7 @@ ipvsadm -ln
 ## TODO
 
 ### LVS
-* use Linux HTB to enhance ACL
+* use Linux HTB to enhance SLA
 * use ipset to do whitelist or blacklist
 * LVS DPDK?
 
